@@ -16,7 +16,7 @@ int main(int argc, char* argv[]) {
 
     vector<vector<double>> X_all;
     vector<double> Y_all;
-    loadDataset("dataset.txt", X_all, Y_all);
+    loadDataset("../dataset.txt", X_all, Y_all);
 
     if (X_all.empty()) {
         cerr << "Error: dataset vacío o no encontrado." << endl;

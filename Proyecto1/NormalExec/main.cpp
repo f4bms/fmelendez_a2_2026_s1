@@ -12,7 +12,7 @@ int main() {
     // Cargar todos los datos
     vector<vector<double>> X_all;
     vector<double> Y_all;
-    loadDataset("dataset.txt", X_all, Y_all);
+    loadDataset("../dataset.txt", X_all, Y_all);
     
     int n_samples = X_all.size();
     int n_train = (int)(n_samples * 0.8);

@@ -19,7 +19,7 @@ int main(int argc, char* argv[]) {
     // Cargar dataset
     vector<vector<double>> X_all;
     vector<double> Y_all;
-    loadDataset("dataset.txt", X_all, Y_all);
+    loadDataset("../dataset.txt", X_all, Y_all);
 
     // 80/20 train/test
     int n_train = (int)(X_all.size() * 0.8);

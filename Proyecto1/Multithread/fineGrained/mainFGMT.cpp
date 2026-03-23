@@ -18,12 +18,7 @@ int main(int argc, char* argv[]) {
     // Cargar dataset
     vector<vector<double>> X_all;
     vector<double> Y_all;
-    loadDataset("dataset.txt", X_all, Y_all);
-
-    if (X_all.empty()) {
-        cerr << "Error: dataset vacío o no encontrado." << endl;
-        return 1;
-    }
+    loadDataset("../dataset.txt", X_all, Y_all);
 
     // 80% entrenamiento, 20% pruebas
     int n_train = (int)(X_all.size() * 0.8);
