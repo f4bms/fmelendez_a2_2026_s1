@@ -1,5 +1,9 @@
-//algoritmo de entrenamiento roundrobin -fine grained con hilos 
-//el context switch se realiza para cada multiplicación
+// Algoritmo de entrenamiento Round-Robin (fine-grained multithreading - FGMT) con hilos.
+// - El "context switch" (cambio de turno) ocurre en CADA multiplicación (1 multiplicación = 1 ciclo).
+// - Para mantener consistencia con CGMT, se clasifica cada multiplicación como:
+//   * liviana (light): operaciones del forward.
+//   * pesada (heavy): operaciones del backprop y actualización de pesos.
+// - Operaciones "fuera de ciclos" (lr*grad, error^2, etc.) se contabilizan aparte con mul_total().
 
 #include <iostream>
 #include <fstream>
@@ -10,21 +14,21 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <atomic>
 #include <queue>
 #include <chrono>
 #include <iomanip>
+#include <random>
 
 using namespace std;
 using namespace std::chrono;
 
-// Constantes
 const int INPUT_DIM = 3;
 const int HIDDEN_NEURONS = 30;
 const int OUTPUT_DIM = 1;
 const double LEARNING_RATE = 0.08;
-const int EPOCHS = 1500;
+const int EPOCHS = 1000;
 
-// activación
 double tanh_activation(double x) {
     return tanh(x);
 }
@@ -42,29 +46,37 @@ double basefunction(double x[], int d){
     return sum;
 }
 
-//scheduler por round robin
+// Scheduler Round-Robin (FGMT): un único hilo tiene el turno, y luego se avanza al siguiente.
 class RoundRobinScheduler {
 private:
     int num_threads;
-    long long quantum;
-    long long multiplication_count;
+    long long light_count;
+    long long heavy_count;
+    long long stall_nop_count;
     long long total_multiplications;
-    long long nop_count;
     long long global_clock;
     int current_turn;
+
     mutex m;
     condition_variable cv;
     int phase_done_count;
     bool phase_open;
-    
+
+    atomic<int> next_neuron;
+    static const int STALL_EVERY = 10000;
+    vector<int> thread_mul_counter;
+
 public:
-    RoundRobinScheduler(int num_threads_arg, long long quantum_size = 1) 
-    : num_threads(num_threads_arg), quantum(quantum_size),
-    multiplication_count(0), total_multiplications(0), nop_count(0),
-    global_clock(0), current_turn(0),
-    phase_done_count(0), phase_open(false) {}
+    RoundRobinScheduler(int num_threads_arg, long long /*quantum_size*/ = 1)
+    : num_threads(num_threads_arg),
+      light_count(0), heavy_count(0), stall_nop_count(0),
+      total_multiplications(0), global_clock(0), current_turn(0),
+      phase_done_count(0), phase_open(false),
+      next_neuron(0),
+      thread_mul_counter(num_threads_arg, 0) {}
 
     void begin_phase() {
+        next_neuron.store(0, memory_order_relaxed);
         unique_lock<mutex> lock(m);
         phase_open = true;
         phase_done_count = 0;
@@ -72,85 +84,95 @@ public:
         cv.notify_all();
     }
 
-    //para cuando termina un thread
+    // Espera el turno del hilo. Retorna true si la fase sigue abierta.
+    // Es el ÚNICO punto de bloqueo: no se llama desde ninguna otra función.
+    bool wait_turn(int thread_id) {
+        unique_lock<mutex> lock(m);
+        cv.wait(lock, [&] { return !phase_open || current_turn == thread_id; });
+        return phase_open;
+    }
+
+    // Avanza el turno. Siempre se llama después de wait_turn.
+    void advance_turn() {
+        unique_lock<mutex> lock(m);
+        global_clock++;
+        current_turn = (current_turn + 1) % num_threads;
+        cv.notify_all();
+    }
+
+    // Registra que este hilo terminó su trabajo.
+    // NO participa en la rotación — solo cierra la fase cuando todos terminaron.
     void mark_done() {
         unique_lock<mutex> lock(m);
         if (!phase_open) return;
         phase_done_count++;
-        if (phase_done_count >= num_threads) {
-            phase_open = false;
-        }
+        if (phase_done_count >= num_threads) phase_open = false;
         cv.notify_all();
     }
 
-    bool is_phase_open() {
-        lock_guard<mutex> lock(m);
-        return phase_open;
+    // Toma el siguiente índice de neurona disponible. Retorna -1 si no hay más.
+    int take_next(int total) {
+        int idx = next_neuron.fetch_add(1, memory_order_relaxed);
+        return (idx < total) ? idx : -1;
     }
 
-    //bloquea el turno hasta que sea el turno del thread_id
-    void wait_turn(int thread_id) {
-        unique_lock<mutex> lock(m);
-        cv.wait(lock, [&] {
-            if (!phase_open) return true;
-            return current_turn == thread_id;
-        });
-    }
+    // Contadores de multiplicaciones (llamar dentro del turno, con la fase garantizada abierta).
+    // Consistencia con CGMT: forward => count_light(); backprop/update => count_heavy().
+    void count_light() { lock_guard<mutex> l(m); light_count++; }
+    void count_heavy() { lock_guard<mutex> l(m); heavy_count++; }
 
-    //Avance turno
-    void advance_turn() {
-        unique_lock<mutex> lock(m);
-        global_clock++;
-    current_turn = (current_turn + 1) % num_threads;
-        cv.notify_all();
-    }
-
-    //operacion que toma 1 "ciclo", espera turno, ejecuta 1 multiplicacion, y rota(context switch)
+    // Multiplicaciones EN ciclos.
+    // En FGMT, cada llamada debe ejecutarse DENTRO del turno del hilo (entre wait_turn y advance_turn).
     template <typename T>
-    T mul_fgmt(int thread_id, T a, T b) {
-        wait_turn(thread_id);
-        // Si la fase cerró mientras esperábamos, devolvemos algo neutral.
-        if (!is_phase_open()) return T{};
-        multiplication_count++;
-        total_multiplications++;
-        T r = a * b;
-        advance_turn();
-        return r;
+    T mul_light(T a, T b) {
+        count_light();
+        return a * b;
     }
 
-    // Multiplicación "normal": se cuenta, pero NO fuerza turnos ni consume clock.
+    template <typename T>
+    T mul_heavy(T a, T b) {
+        count_heavy();
+        return a * b;
+    }
+
+    // Stall: si el hilo llegó a STALL_EVERY multiplicaciones, consume UN turno adicional como NOP.
+    // Retorna false si la fase cerró durante el stall (el hilo debe salir).
+    bool check_stall(int thread_id) {
+        thread_mul_counter[thread_id]++;
+        if (thread_mul_counter[thread_id] >= STALL_EVERY) {
+            thread_mul_counter[thread_id] = 0;
+            if (!wait_turn(thread_id)) return false; // fase cerró → salir
+            { lock_guard<mutex> l(m); stall_nop_count++; }
+            advance_turn();
+        }
+        return true;
+    }
+
+    // Multiplicación fuera de ciclos (lr * grad, error^2, etc.).
     template <typename T>
     T mul_total(T a, T b) {
+        lock_guard<mutex> lock(m);
         total_multiplications++;
         return a * b;
     }
 
-    //NOP: consume 1 ciclo y rota turno aunque este thread no tenga trabajo
-    void idle_fgmt(int thread_id) {
-        wait_turn(thread_id);
-        if (!is_phase_open()) return;
-    nop_count++;
-        advance_turn();
-    }
-    
-    long long get_multiplication_count() const {
-        return multiplication_count;
-    }
-
+    // --- getters ---
+    long long get_light_count()           const { return light_count; }
+    long long get_heavy_count()           const { return heavy_count; }
+    long long get_stall_nop_count()       const { return stall_nop_count; }
     long long get_total_multiplications() const { return total_multiplications; }
+    long long get_global_clock()          const { return global_clock; }
+    int       get_num_threads()           const { return num_threads; }
 
-    long long get_nop_count() const { return nop_count; }
-
-    long long get_global_clock() const { return global_clock; }
-    
-    int get_num_threads() const { return num_threads; }
-    
     void print_stats() {
+        long long cycle_muls = light_count + heavy_count;
         cout << "\n --- metricas ---" << endl;
-        cout << "multiplicaciones/ciclos: " << multiplication_count << endl;
-        cout << "multiplicaciones totales: " << total_multiplications << endl;
-        cout << "NOPs: " << nop_count << endl;
-        cout << "ciclos simulados: " << global_clock << endl;
+        cout << "multiplicaciones light (ciclos):  " << light_count          << endl;
+        cout << "multiplicaciones heavy (ciclos):  " << heavy_count          << endl;
+        cout << "total multiplicaciones en ciclos: " << cycle_muls           << endl;
+        cout << "multiplicaciones fuera de ciclos: " << total_multiplications << endl;
+        cout << "NOPs por stall:                   " << stall_nop_count      << endl;
+        cout << "ciclos simulados:  " << global_clock         << endl;
         cout << "----------------------\n" << endl;
     }
 };
@@ -169,15 +191,31 @@ private:
     double output[OUTPUT_DIM];
     
     RoundRobinScheduler* scheduler;
+
+    // RNG por instancia (evita rand()/srand() globales que no son thread-safe)
+    std::mt19937 rng;
+
+    double uniform_symmetric(double scale) {
+        // [-scale, scale]
+        std::uniform_real_distribution<double> dist(-scale, scale);
+        return dist(rng);
+    }
     
 public:
     NeuralNetworkFineGrained(RoundRobinScheduler* sched) : scheduler(sched) {
-        srand(time(NULL));
+        // Semilla por red, evitando estado global compartido.
+        // random_device puede ser lento/no determinista; se mezcla con reloj para robustez.
+        std::random_device rd;
+        auto now = static_cast<unsigned>(
+            std::chrono::high_resolution_clock::now().time_since_epoch().count());
+        std::seed_seq seed{rd(), now, static_cast<unsigned>(reinterpret_cast<uintptr_t>(this))};
+        rng.seed(seed);
         
         // Inicializar pesos input -> hidden
         for (int i = 0; i < INPUT_DIM; i++) {
             for (int j = 0; j < HIDDEN_NEURONS; j++) {
-                wh[i][j] = ((double)rand() / RAND_MAX - 0.5) * sqrt(2.0 / INPUT_DIM);
+                // equivalente a (rand/RAND_MAX - 0.5) * sqrt(2/input)
+                wh[i][j] = uniform_symmetric(0.5) * sqrt(2.0 / INPUT_DIM);
             }
         }
         
@@ -189,7 +227,7 @@ public:
         // Inicializar pesos hidden -> output
         for (int i = 0; i < HIDDEN_NEURONS; i++) {
             for (int j = 0; j < OUTPUT_DIM; j++) {
-                wo[i][j] = ((double)rand() / RAND_MAX - 0.5) * sqrt(2.0 / HIDDEN_NEURONS);
+                wo[i][j] = uniform_symmetric(0.5) * sqrt(2.0 / HIDDEN_NEURONS);
             }
         }
         
@@ -204,41 +242,56 @@ public:
         vector<thread> threads;
         int num_threads = scheduler->get_num_threads();
 
-    /* este scheduler va por neuronas y dentro de cada neurona se realiza el forward que dentro del forward
-    está el scheduler que hace el roundrobin para las multiplicicaciones
-    */
+    /* Modelo de turno único para todos los lambdas:
+       Cada iteración del while es exactamente: wait_turn → acción → advance_turn
+       Sin wait_turns anidados, sin muls con wait interno.
+       Estado por hilo: cur_neuron (-1 = necesita fetch), cur_dim, idle (sin más trabajo) */
+
     scheduler->begin_phase();
         auto compute_hidden = [&](int thread_id) {
-            int start = thread_id;
-            int step = num_threads;
+            int cur_neuron = -1, cur_dim = 0;
+            bool idle = false;
+            while (true) {
+                if (!scheduler->wait_turn(thread_id)) break; // fase cerrada
 
-            int j = start;
-            while (scheduler->is_phase_open()) {
-                if (j < HIDDEN_NEURONS) {
-                    // COMPUTE una neurona
-                    hidden_input[j] = bh[j];
-                    for (int i = 0; i < INPUT_DIM; i++) {
-                        hidden_input[j] += scheduler->mul_fgmt(thread_id, input[i], wh[i][j]);
-                    }
-                    hidden_output[j] = tanh_activation(hidden_input[j]);
-                    j += step;
+                if (idle) {
+                    // NOP: mantiene la rotación hasta que todos terminen
+                    scheduler->advance_turn();
 
-                    if (j >= HIDDEN_NEURONS) {
+                } else if (cur_neuron < 0) {
+                    // FETCH: tomar neurona — este ciclo es un NOP de despacho,
+                    // no se hace ninguna multiplicación. La primera mul ocurre
+                    // en el siguiente ciclo (bloque WORK abajo).
+                    int j = scheduler->take_next(HIDDEN_NEURONS);
+                    if (j < 0) {
                         scheduler->mark_done();
+                        idle = true;
+                    } else {
+                        cur_neuron = j;
+                        cur_dim = 0;
+                        hidden_input[j] = bh[j];
                     }
+                    scheduler->advance_turn();
+
                 } else {
-                    scheduler->idle_fgmt(thread_id);
+                    // WORK: una multiplicación por ciclo — round-robin puro
+                    // Forward => multiplicación liviana
+                    hidden_input[cur_neuron] += scheduler->mul_light(input[cur_dim], wh[cur_dim][cur_neuron]);
+                    cur_dim++;
+                    if (cur_dim >= INPUT_DIM) {
+                        hidden_output[cur_neuron] = tanh_activation(hidden_input[cur_neuron]);
+                        cur_neuron = -1;
+                    }
+                    scheduler->advance_turn();
+                    if (!scheduler->check_stall(thread_id)) break;
                 }
             }
         };
 
-
         //terminación de la fase oculta
-        
         for (int t = 0; t < num_threads; t++) {
             threads.emplace_back(compute_hidden, t);
         }
-        
         for (auto& t : threads) {
             t.join();
         }
@@ -250,25 +303,35 @@ public:
         }
 
         auto compute_output = [&](int thread_id) {
-            int start_idx = thread_id;
-            int step_idx = num_threads;
-            int i = start_idx;
+            int cur_neuron = -1, cur_out = 0;
+            bool idle = false;
+            while (true) {
+                if (!scheduler->wait_turn(thread_id)) break;
 
-            while (scheduler->is_phase_open()) {
-                if (i < HIDDEN_NEURONS) {
-                    for (int outj = 0; outj < OUTPUT_DIM; outj++) {
-                        output_input[outj] += scheduler->mul_fgmt(thread_id, hidden_output[i], wo[i][outj]);
+                if (idle) {
+                    scheduler->advance_turn();
+
+                } else if (cur_neuron < 0) {
+                    // FETCH: ciclo NOP de despacho
+                    int i = scheduler->take_next(HIDDEN_NEURONS);
+                    if (i < 0) {
+                        scheduler->mark_done(); idle = true;
+                    } else {
+                        cur_neuron = i; cur_out = 0;
                     }
-                    i += step_idx;
-                    if (i >= HIDDEN_NEURONS) {
-                        scheduler->mark_done();
-                    }
+                    scheduler->advance_turn();
+
                 } else {
-                    scheduler->idle_fgmt(thread_id);
+                    // WORK: una multiplicación por ciclo
+                    // Forward => multiplicación liviana
+                    output_input[cur_out] += scheduler->mul_light(hidden_output[cur_neuron], wo[cur_neuron][cur_out]);
+                    cur_out++;
+                    if (cur_out >= OUTPUT_DIM) cur_neuron = -1;
+                    scheduler->advance_turn();
+                    if (!scheduler->check_stall(thread_id)) break;
                 }
             }
         };
-
 
 // Finalizacion de la capa de salida
         threads.clear();
@@ -298,91 +361,146 @@ public:
         double hidden_error[HIDDEN_NEURONS];
         double hidden_delta[HIDDEN_NEURONS];
 
-        // hidden_error
-        //se hace con el scheduler pq como analiza para atras ocupa aún repartir el trabajo por neurona 
+    // hidden_error/hidden_delta (equivalente a CGMT: mul_cgmt_heavy)
         int num_threads = scheduler->get_num_threads();
         scheduler->begin_phase();
         vector<thread> threads;
         auto compute_hidden_error = [&](int thread_id) {
-            int j = thread_id;
-            int step = num_threads;
-            while (scheduler->is_phase_open()) {
-                if (j < HIDDEN_NEURONS) {
-                    hidden_error[j] = 0.0;
-                    for (int k = 0; k < OUTPUT_DIM; k++) {
-                        hidden_error[j] += scheduler->mul_fgmt(thread_id, output_delta[k], wo[j][k]);
+            // Estado: qué neurona proceso y en qué mul estoy
+            // Cada neurona backward hace:
+            // - OUTPUT_DIM multiplicaciones para acumular hidden_error.
+            // - 1 multiplicación para t*t (derivada de tanh).
+            // - 1 multiplicación para hidden_error * deriv (hidden_delta).
+            // En CGMT, TODAS estas multiplicaciones se consideran "pesadas".
+            // Las agrupamos en fases: fase 0=error_acum, fase 1=t*t, fase 2=delta.
+            int cur_neuron = -1, cur_phase = 0, cur_k = 0;
+            bool idle = false;
+            while (true) {
+                if (!scheduler->wait_turn(thread_id)) break;
+
+                if (idle) {
+                    scheduler->advance_turn();
+
+                } else if (cur_neuron < 0) {
+                    // FETCH: ciclo NOP de despacho
+                    int j = scheduler->take_next(HIDDEN_NEURONS);
+                    if (j < 0) {
+                        scheduler->mark_done(); idle = true;
+                    } else {
+                        cur_neuron = j; cur_phase = 0; cur_k = 0;
+                        hidden_error[j] = 0.0;
                     }
+                    scheduler->advance_turn();
 
-                    double t = tanh(hidden_input[j]);
-                    // Estas multiplicaciones forman parte del cómputo por neurona (delta),
-                    // así que también pasan por el round-robin.
-                    double deriv = 1.0 - scheduler->mul_fgmt(thread_id, t, t);
+                } else if (cur_phase == 0) {
+                    // acumulando hidden_error — una mul por ciclo
+                    hidden_error[cur_neuron] += scheduler->mul_heavy(output_delta[cur_k], wo[cur_neuron][cur_k]);
+                    cur_k++;
+                    if (cur_k >= OUTPUT_DIM) cur_phase = 1;
+                    scheduler->advance_turn();
+                    if (!scheduler->check_stall(thread_id)) break;
 
-                    hidden_delta[j] = scheduler->mul_fgmt(thread_id, hidden_error[j], deriv);
-                    j += step;
-                    if (j >= HIDDEN_NEURONS) scheduler->mark_done();
+                } else if (cur_phase == 1) {
+                    // mul t*t para la derivada de tanh
+                    double t = tanh(hidden_input[cur_neuron]);
+                    double tt = scheduler->mul_heavy(t, t);
+                    hidden_delta[cur_neuron] = 1.0 - tt; // guardamos deriv temporalmente
+                    cur_phase = 2;
+                    scheduler->advance_turn();
+                    if (!scheduler->check_stall(thread_id)) break;
+
                 } else {
-                    scheduler->idle_fgmt(thread_id);
+                    // mul hidden_error * deriv = hidden_delta
+                    hidden_delta[cur_neuron] = scheduler->mul_heavy(hidden_error[cur_neuron], hidden_delta[cur_neuron]);
+                    cur_neuron = -1;
+                    scheduler->advance_turn();
+                    if (!scheduler->check_stall(thread_id)) break;
                 }
             }
         };
 
         for (int t = 0; t < num_threads; t++) threads.emplace_back(compute_hidden_error, t);
         for (auto& t : threads) t.join();
-        
-        //pesos de hidden - output
+
+    // Actualización de pesos hidden -> output (equivalente a CGMT: mul_cgmt_heavy)
         scheduler->begin_phase();
         threads.clear();
         auto update_wo = [&](int thread_id) {
-            int i = thread_id;
-            int step = num_threads;
-            while (scheduler->is_phase_open()) {
-                if (i < HIDDEN_NEURONS) {
-                    for (int j = 0; j < OUTPUT_DIM; j++) {
-                        // grad = output_delta * hidden_output (FGMT)
-                        double grad = scheduler->mul_fgmt(thread_id, output_delta[j], hidden_output[i]);
-                        // learning_rate * grad (total)
-                        wo[i][j] -= scheduler->mul_total(learning_rate, grad);
+            int cur_neuron = -1, cur_out = 0;
+            bool idle = false;
+            while (true) {
+                if (!scheduler->wait_turn(thread_id)) break;
+
+                if (idle) {
+                    scheduler->advance_turn();
+
+                } else if (cur_neuron < 0) {
+                    // FETCH: ciclo NOP de despacho
+                    int i = scheduler->take_next(HIDDEN_NEURONS);
+                    if (i < 0) {
+                        scheduler->mark_done(); idle = true;
+                    } else {
+                        cur_neuron = i; cur_out = 0;
                     }
-                    i += step;
-                    if (i >= HIDDEN_NEURONS) scheduler->mark_done();
+                    scheduler->advance_turn();
+
                 } else {
-                    scheduler->idle_fgmt(thread_id);
+                    // WORK: una mul por ciclo — backward heavy
+                    double grad = scheduler->mul_heavy(output_delta[cur_out], hidden_output[cur_neuron]);
+                    wo[cur_neuron][cur_out] -= scheduler->mul_total(learning_rate, grad);
+                    cur_out++;
+                    if (cur_out >= OUTPUT_DIM) cur_neuron = -1;
+                    scheduler->advance_turn();
+                    if (!scheduler->check_stall(thread_id)) break;
                 }
             }
         };
         for (int t = 0; t < num_threads; t++) threads.emplace_back(update_wo, t);
         for (auto& t : threads) t.join();
         
-        //bias output
+    // Bias de salida (fuera de ciclos, igual que CGMT)
         for (int j = 0; j < OUTPUT_DIM; j++) {
             // lr * delta (total)
             bo[j] -= scheduler->mul_total(learning_rate, output_delta[j]);
         }
         
-        //pesos input - hidden
+    // Actualización de pesos input -> hidden (equivalente a CGMT: mul_cgmt_heavy)
         scheduler->begin_phase();
         threads.clear();
         auto update_wh = [&](int thread_id) {
-            int j = thread_id;
-            int step = num_threads;
-            while (scheduler->is_phase_open()) {
-                if (j < HIDDEN_NEURONS) {
-                    for (int i = 0; i < INPUT_DIM; i++) {
-                        double grad = scheduler->mul_fgmt(thread_id, hidden_delta[j], input[i]);
-                        wh[i][j] -= scheduler->mul_total(learning_rate, grad);
+            int cur_neuron = -1, cur_dim = 0;
+            bool idle = false;
+            while (true) {
+                if (!scheduler->wait_turn(thread_id)) break;
+
+                if (idle) {
+                    scheduler->advance_turn();
+
+                } else if (cur_neuron < 0) {
+                    // FETCH: ciclo NOP de despacho
+                    int j = scheduler->take_next(HIDDEN_NEURONS);
+                    if (j < 0) {
+                        scheduler->mark_done(); idle = true;
+                    } else {
+                        cur_neuron = j; cur_dim = 0;
                     }
-                    j += step;
-                    if (j >= HIDDEN_NEURONS) scheduler->mark_done();
+                    scheduler->advance_turn();
+
                 } else {
-                    scheduler->idle_fgmt(thread_id);
+                    // WORK: una mul por ciclo — backward heavy
+                    double grad = scheduler->mul_heavy(hidden_delta[cur_neuron], input[cur_dim]);
+                    wh[cur_dim][cur_neuron] -= scheduler->mul_total(learning_rate, grad);
+                    cur_dim++;
+                    if (cur_dim >= INPUT_DIM) cur_neuron = -1;
+                    scheduler->advance_turn();
+                    if (!scheduler->check_stall(thread_id)) break;
                 }
             }
         };
         for (int t = 0; t < num_threads; t++) threads.emplace_back(update_wh, t);
         for (auto& t : threads) t.join();
         
-        // bias hidden
+    // Bias de capa oculta (fuera de ciclos, igual que CGMT)
         for (int j = 0; j < HIDDEN_NEURONS; j++) {
             bh[j] -= scheduler->mul_total(learning_rate, hidden_delta[j]);
         }
