@@ -27,7 +27,7 @@ const int INPUT_DIM = 3;
 const int HIDDEN_NEURONS = 30;
 const int OUTPUT_DIM = 1;
 const double LEARNING_RATE = 0.08;
-const int EPOCHS = 1000;
+const int EPOCHS = 1500;
 
 double tanh_activation(double x) {
     return tanh(x);
