@@ -1,15 +1,9 @@
-// Algoritmo de entrenamiento Round-Robin (fine-grained multithreading - FGMT) con hilos.
-// - El "context switch" (cambio de turno) ocurre en CADA multiplicación (1 multiplicación = 1 ciclo).
-// - Para mantener consistencia con CGMT, se clasifica cada multiplicación como:
-//   * liviana (light): operaciones del forward.
-//   * pesada (heavy): operaciones del backprop y actualización de pesos.
-// - Operaciones "fuera de ciclos" (lr*grad, error^2, etc.) se contabilizan aparte con mul_total().
-
+/* Algoritmo de entrenamiento de una red neuronal utilizando fine grained multithreading
+-simulacion de ejecución de ciclos por multiplicaciones(3 tipos: livianas, pesadas y fuera de ciclos)
+-round robin scheduler: alterna entre hilos en cada multiplicación
+*/
 #include <iostream>
-#include <fstream>
-#include <cmath>
 #include <cstdlib>
-#include <ctime>
 #include <vector>
 #include <thread>
 #include <mutex>
@@ -19,34 +13,15 @@
 #include <chrono>
 #include <iomanip>
 #include <random>
+#include "../../common/nn_config.h"
+#include "../../common/nn_math.h"
+#include "../../common/dataset.h"
 
 using namespace std;
 using namespace std::chrono;
 
-const int INPUT_DIM = 3;
-const int HIDDEN_NEURONS = 30;
-const int OUTPUT_DIM = 1;
-const double LEARNING_RATE = 0.08;
-const int EPOCHS = 1500;
-
-double tanh_activation(double x) {
-    return tanh(x);
-}
-
-double tanh_derivative(double x) {
-    double t = tanh(x);
-    return 1.0 - t * t;
-}
-
-double basefunction(double x[], int d){
-    double sum = 0;
-    for(int i=0;i<d;i++){
-        sum += sin(x[i]) + 0.3*x[i]*x[i];
-    }
-    return sum;
-}
-
-// Scheduler Round-Robin (FGMT): un único hilo tiene el turno, y luego se avanza al siguiente.
+// scheduler de round robin
+// distribuido por neuronas y ciclos establecidos como multiplicaciones
 class RoundRobinScheduler {
 private:
     int num_threads;
@@ -84,15 +59,14 @@ public:
         cv.notify_all();
     }
 
-    // Espera el turno del hilo. Retorna true si la fase sigue abierta.
-    // Es el ÚNICO punto de bloqueo: no se llama desde ninguna otra función.
+    // espera el turno del hilo y retorna true si la fase sigue abierta
     bool wait_turn(int thread_id) {
         unique_lock<mutex> lock(m);
         cv.wait(lock, [&] { return !phase_open || current_turn == thread_id; });
         return phase_open;
     }
 
-    // Avanza el turno. Siempre se llama después de wait_turn.
+    // avanza el turno
     void advance_turn() {
         unique_lock<mutex> lock(m);
         global_clock++;
@@ -100,8 +74,7 @@ public:
         cv.notify_all();
     }
 
-    // Registra que este hilo terminó su trabajo.
-    // NO participa en la rotación — solo cierra la fase cuando todos terminaron.
+    // Registra que este hilo terminó su trabajo, solo cierra la fase cuando ya todos terminaron
     void mark_done() {
         unique_lock<mutex> lock(m);
         if (!phase_open) return;
@@ -110,19 +83,15 @@ public:
         cv.notify_all();
     }
 
-    // Toma el siguiente índice de neurona disponible. Retorna -1 si no hay más.
+    // Toma el siguiente índice de neurona disponible y retorna -1 si no hay más
     int take_next(int total) {
         int idx = next_neuron.fetch_add(1, memory_order_relaxed);
         return (idx < total) ? idx : -1;
     }
 
-    // Contadores de multiplicaciones (llamar dentro del turno, con la fase garantizada abierta).
-    // Consistencia con CGMT: forward => count_light(); backprop/update => count_heavy().
     void count_light() { lock_guard<mutex> l(m); light_count++; }
     void count_heavy() { lock_guard<mutex> l(m); heavy_count++; }
 
-    // Multiplicaciones EN ciclos.
-    // En FGMT, cada llamada debe ejecutarse DENTRO del turno del hilo (entre wait_turn y advance_turn).
     template <typename T>
     T mul_light(T a, T b) {
         count_light();
@@ -134,9 +103,7 @@ public:
         count_heavy();
         return a * b;
     }
-
-    // Stall: si el hilo llegó a STALL_EVERY multiplicaciones, consume UN turno adicional como NOP.
-    // Retorna false si la fase cerró durante el stall (el hilo debe salir).
+    //se toma turno(nop) si llegó al stall, retona dalso si el hilo debe de salir
     bool check_stall(int thread_id) {
         thread_mul_counter[thread_id]++;
         if (thread_mul_counter[thread_id] >= STALL_EVERY) {
@@ -156,7 +123,6 @@ public:
         return a * b;
     }
 
-    // --- getters ---
     long long get_light_count()           const { return light_count; }
     long long get_heavy_count()           const { return heavy_count; }
     long long get_stall_nop_count()       const { return stall_nop_count; }
@@ -167,10 +133,10 @@ public:
     void print_stats() {
         long long cycle_muls = light_count + heavy_count;
         cout << "\n --- metricas ---" << endl;
-        cout << "multiplicaciones light (ciclos):  " << light_count          << endl;
-        cout << "multiplicaciones heavy (ciclos):  " << heavy_count          << endl;
-        cout << "total multiplicaciones en ciclos: " << cycle_muls           << endl;
-        cout << "multiplicaciones fuera de ciclos: " << total_multiplications << endl;
+        cout << "mult light:  " << light_count          << endl;
+        cout << "mult heavy:  " << heavy_count          << endl;
+        cout << "mult fuera de ciclos: " << total_multiplications << endl;
+        cout << "total mult en ciclos: " << cycle_muls           << endl;
         cout << "NOPs por stall:                   " << stall_nop_count      << endl;
         cout << "ciclos simulados:  " << global_clock         << endl;
         cout << "----------------------\n" << endl;
@@ -192,11 +158,10 @@ private:
     
     RoundRobinScheduler* scheduler;
 
-    // RNG por instancia (evita rand()/srand() globales que no son thread-safe)
+    //se usa un generador de numeros aleatorios
     std::mt19937 rng;
 
     double uniform_symmetric(double scale) {
-        // [-scale, scale]
         std::uniform_real_distribution<double> dist(-scale, scale);
         return dist(rng);
     }
@@ -211,27 +176,27 @@ public:
         std::seed_seq seed{rd(), now, static_cast<unsigned>(reinterpret_cast<uintptr_t>(this))};
         rng.seed(seed);
         
-        // Inicializar pesos input -> hidden
+        // base inicial de pesos de input a hidden
         for (int i = 0; i < INPUT_DIM; i++) {
             for (int j = 0; j < HIDDEN_NEURONS; j++) {
                 // equivalente a (rand/RAND_MAX - 0.5) * sqrt(2/input)
                 wh[i][j] = uniform_symmetric(0.5) * sqrt(2.0 / INPUT_DIM);
             }
         }
-        
-        // Inicializar bias hidden
+
+        // base inicial de bias hidden
         for (int j = 0; j < HIDDEN_NEURONS; j++) {
             bh[j] = 0.0;
         }
-        
-        // Inicializar pesos hidden -> output
+
+        // base inicial de pesos de hidden a output
         for (int i = 0; i < HIDDEN_NEURONS; i++) {
             for (int j = 0; j < OUTPUT_DIM; j++) {
                 wo[i][j] = uniform_symmetric(0.5) * sqrt(2.0 / HIDDEN_NEURONS);
             }
         }
-        
-        // Inicializar bias output
+
+        // base inicial de bias output
         for (int j = 0; j < OUTPUT_DIM; j++) {
             bo[j] = 0.0;
         }
@@ -242,26 +207,23 @@ public:
         vector<thread> threads;
         int num_threads = scheduler->get_num_threads();
 
-    /* Modelo de turno único para todos los lambdas:
-       Cada iteración del while es exactamente: wait_turn → acción → advance_turn
-       Sin wait_turns anidados, sin muls con wait interno.
-       Estado por hilo: cur_neuron (-1 = necesita fetch), cur_dim, idle (sin más trabajo) */
-
+    //el scheduler se realiza por neuronas, dentro de cada una se realizan multiplicaciones
+    //en el forward las multiplicaciones son contadas como light
+    //3 cases por hilo: FETCH, WORK, y IDLE
     scheduler->begin_phase();
         auto compute_hidden = [&](int thread_id) {
             int cur_neuron = -1, cur_dim = 0;
             bool idle = false;
             while (true) {
-                if (!scheduler->wait_turn(thread_id)) break; // fase cerrada
+                if (!scheduler->wait_turn(thread_id)) break;
 
+                //hace que se quede consistente hasta que terminen completamente todos los hilos
                 if (idle) {
-                    // NOP: mantiene la rotación hasta que todos terminen
                     scheduler->advance_turn();
 
+                /*este es una simulacion de un fetch
+                existe una cola de tareas que se procesan en orden y este se toma como un ciclo */
                 } else if (cur_neuron < 0) {
-                    // FETCH: tomar neurona — este ciclo es un NOP de despacho,
-                    // no se hace ninguna multiplicación. La primera mul ocurre
-                    // en el siguiente ciclo (bloque WORK abajo).
                     int j = scheduler->take_next(HIDDEN_NEURONS);
                     if (j < 0) {
                         scheduler->mark_done();
@@ -272,10 +234,10 @@ public:
                         hidden_input[j] = bh[j];
                     }
                     scheduler->advance_turn();
-
+                
+                /* este ya es el trabajo como tal de las multiplicaciones
+                se hace una multiplicacion por ciclo*/
                 } else {
-                    // WORK: una multiplicación por ciclo — round-robin puro
-                    // Forward => multiplicación liviana
                     hidden_input[cur_neuron] += scheduler->mul_light(input[cur_dim], wh[cur_dim][cur_neuron]);
                     cur_dim++;
                     if (cur_dim >= INPUT_DIM) {
@@ -288,7 +250,7 @@ public:
             }
         };
 
-        //terminación de la fase oculta
+        //espera a que todos terminen antes de seguir 
         for (int t = 0; t < num_threads; t++) {
             threads.emplace_back(compute_hidden, t);
         }
@@ -312,7 +274,6 @@ public:
                     scheduler->advance_turn();
 
                 } else if (cur_neuron < 0) {
-                    // FETCH: ciclo NOP de despacho
                     int i = scheduler->take_next(HIDDEN_NEURONS);
                     if (i < 0) {
                         scheduler->mark_done(); idle = true;
@@ -322,8 +283,6 @@ public:
                     scheduler->advance_turn();
 
                 } else {
-                    // WORK: una multiplicación por ciclo
-                    // Forward => multiplicación liviana
                     output_input[cur_out] += scheduler->mul_light(hidden_output[cur_neuron], wo[cur_neuron][cur_out]);
                     cur_out++;
                     if (cur_out >= OUTPUT_DIM) cur_neuron = -1;
@@ -333,7 +292,7 @@ public:
             }
         };
 
-// Finalizacion de la capa de salida
+        // termina de la capa de salida
         threads.clear();
         for (int t = 0; t < num_threads; t++) {
             threads.emplace_back(compute_output, t);
@@ -361,18 +320,10 @@ public:
         double hidden_error[HIDDEN_NEURONS];
         double hidden_delta[HIDDEN_NEURONS];
 
-    // hidden_error/hidden_delta (equivalente a CGMT: mul_cgmt_heavy)
         int num_threads = scheduler->get_num_threads();
         scheduler->begin_phase();
         vector<thread> threads;
         auto compute_hidden_error = [&](int thread_id) {
-            // Estado: qué neurona proceso y en qué mul estoy
-            // Cada neurona backward hace:
-            // - OUTPUT_DIM multiplicaciones para acumular hidden_error.
-            // - 1 multiplicación para t*t (derivada de tanh).
-            // - 1 multiplicación para hidden_error * deriv (hidden_delta).
-            // En CGMT, TODAS estas multiplicaciones se consideran "pesadas".
-            // Las agrupamos en fases: fase 0=error_acum, fase 1=t*t, fase 2=delta.
             int cur_neuron = -1, cur_phase = 0, cur_k = 0;
             bool idle = false;
             while (true) {
@@ -560,21 +511,4 @@ public:
     RoundRobinScheduler* get_scheduler() { return scheduler; }
 };
 
-//cargar datos del archivo txt
-void loadDataset(const string& filename, vector<vector<double>>& X, vector<double>& Y) {
-    ifstream file(filename);
-    
-    if (!file.is_open()) {
-        cerr << "Error: No se pudo abrir el archivo" << endl;
-        return;
-    }
-    
-    double x1, x2, x3, y;
-    while (file >> x1 >> x2 >> x3 >> y) {
-        X.push_back({x1, x2, x3});
-        Y.push_back(y);
-    }
-    
-    file.close();
-    cout << "Dataset cargado: " << X.size() << " muestras" << endl;
-}
+// loadDataset(...) movido a common/dataset.h

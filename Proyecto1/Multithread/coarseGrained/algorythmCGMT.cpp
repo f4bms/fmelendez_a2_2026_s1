@@ -4,8 +4,6 @@
 // - En esta implementación, los stalls se disparan de forma NO determinística: cada N
 //   multiplicaciones "pesadas" (N aleatorio por hilo) ocurre un stall.
 #include <iostream>
-#include <fstream>
-#include <cmath>
 #include <cstdlib>
 #include <ctime>
 #include <vector>
@@ -15,33 +13,14 @@
 #include <chrono>
 #include <iomanip>
 
+#include "../../common/nn_config.h"
+#include "../../common/nn_math.h"
+#include "../../common/dataset.h"
+
 using namespace std;
 using namespace std::chrono;
 
-// Constantes
-const int INPUT_DIM = 3;
-const int HIDDEN_NEURONS = 30;
-const int OUTPUT_DIM = 1;
-const double LEARNING_RATE = 0.08;
-const int EPOCHS = 1500;
-
-// Funciones de activación
-static inline double tanh_activation(double x) { 
-    return tanh(x); 
-}
-
-static inline double tanh_derivative(double x) {
-	double t = tanh(x);
-	return 1.0 - t * t;
-}
-
-double basefunction(double x[], int d) {
-	double sum = 0;
-	for (int i = 0; i < d; i++) {
-		sum += sin(x[i]) + 0.3 * x[i] * x[i];
-	}
-	return sum;
-}
+// (constantes/funciones comunes están en common/)
 
 // Scheduler CGMT:
 // - Hay 1 hilo "activo" a la vez.
@@ -84,7 +63,6 @@ private:
 	condition_variable cv;
 
 	static inline unsigned int xorshift32(unsigned int& state) {
-		// xorshift32: rápido, determinístico y sin locks si el estado es por hilo.
 		state ^= state << 13;
 		state ^= state >> 17;
 		state ^= state << 5;
@@ -542,23 +520,4 @@ public:
 
 	CoarseGrainedScheduler* get_scheduler() { return scheduler; }
 };
-
-// Carga de datos desde archivo .txt
-void loadDataset(const string& filename, vector<vector<double>>& X, vector<double>& Y) {
-	ifstream file(filename);
-	if (!file.is_open()) {
-		cerr << "Error: No se pudo abrir el archivo" << endl;
-		return;
-	}
-
-	double x1, x2, x3, y;
-	while (file >> x1 >> x2 >> x3 >> y) {
-		X.push_back({x1, x2, x3});
-		Y.push_back(y);
-	}
-
-	file.close();
-	cout << "Dataset cargado: " << X.size() << " muestras" << endl;
-}
-
 

@@ -1,42 +1,15 @@
 //algoritmo de entrenamiento basico sin hilos
 
 #include <iostream>
-#include <fstream>
-#include <cmath>
 #include <cstdlib>
 #include <ctime>
 #include <vector>
 
+#include "../common/nn_config.h"
+#include "../common/nn_math.h"
+#include "../common/dataset.h"
+
 using namespace std;
-
-// Constantes de la red neuronal
-
-const int INPUT_DIM = 3;
-const int HIDDEN_NEURONS = 30;
-const int OUTPUT_DIM = 1;
-const double LEARNING_RATE = 0.08;
-const int EPOCHS = 1500;
-
-//se crea la funcion basefunction que espera un arreglo de datos y su dimension
-double basefunction(double x[], int d){
-    double sum = 0;
-    for(int i=0;i<d;i++){
-        sum += sin(x[i]) + 0.3*x[i]*x[i];
-    }
-    return sum;
-}
-
-// Función de activación tanh
-double tanh_activation(double x) {
-    return tanh(x);
-}
-
-// Derivada de tanh
-double tanh_derivative(double x) {
-    double t = tanh(x);
-    return 1.0 - t * t;
-}
-
 
 class NeuralNetwork {
 private:
@@ -80,7 +53,7 @@ public:
         }
     }
 
-    //FORWARD PROPAGATION ---------------------------------------
+    //FORWARDPROPAGATION ---------------------------------------
     double forward(double input[]) {
         // Capa oculta
         for (int j = 0; j < HIDDEN_NEURONS; j++) {
@@ -212,24 +185,3 @@ public:
     
 
 };
-
-//se cargan los datos del archivo txt
-void loadDataset(const string& filename, vector<vector<double>>& X, vector<double>& Y) {
-    ifstream file(filename);
-    
-    if (!file.is_open()) {
-        cerr << "Error: No se pudo abrir el archivo de datos" << endl;
-        return;
-    }
-    
-    double x1, x2, x3, y;
-    while (file >> x1 >> x2 >> x3 >> y) {
-        vector<double> input = {x1, x2, x3};
-        X.push_back(input);
-        Y.push_back(y);
-    }
-    
-    file.close();
-    cout << "Dataset cargado: " << X.size() << " muestras" << endl;
-}
-

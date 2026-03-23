@@ -3,6 +3,8 @@
    El stall se simula cada 10 multiplicaciones por hilo → NOP + cede turno. */
 #include "algorythmFGMT.cpp"
 
+#include "../../common/runner.h"
+
 int main(int argc, char* argv[]) {
     int num_threads = 2;
     
@@ -18,14 +20,16 @@ int main(int argc, char* argv[]) {
     // Cargar dataset
     vector<vector<double>> X_all;
     vector<double> Y_all;
-    loadDataset("../dataset.txt", X_all, Y_all);
+    if (!loadDataset("../dataset.txt", X_all, Y_all) || X_all.empty()) {
+        cerr << "Error: dataset vacío o no encontrado." << endl;
+        return 1;
+    }
 
-    // 80% entrenamiento, 20% pruebas
-    int n_train = (int)(X_all.size() * 0.8);
-    vector<vector<double>> X_train(X_all.begin(), X_all.begin() + n_train);
-    vector<double> Y_train(Y_all.begin(), Y_all.begin() + n_train);
-    vector<vector<double>> X_test(X_all.begin() + n_train, X_all.end());
-    vector<double> Y_test(Y_all.begin() + n_train, Y_all.end());
+    auto split = split_train_test(X_all, Y_all, 0.8);
+    auto& X_train = split.X_train;
+    auto& Y_train = split.Y_train;
+    auto& X_test  = split.X_test;
+    auto& Y_test  = split.Y_test;
     
     cout << "Entrenamiento: " << X_train.size() << " muestras" << endl;
     cout << "Pruebas:       " << X_test.size()  << " muestras\n" << endl;
@@ -47,22 +51,8 @@ int main(int argc, char* argv[]) {
     // Evaluación
     cout << "\n Evaluación del modelo" << endl;
     double test_mse = nn.evaluate(X_test, Y_test);
-    cout << "Test MSE:  " << fixed << setprecision(6) << test_mse << endl;
-    cout << "Test RMSE: " << sqrt(test_mse) << endl;
-    
-    // Algunas predicciones para verificar funcionamiento
-    cout << "\nMuestras de predicción:" << endl;
-    for (int i = 0; i < min(5, (int)X_test.size()); i++) {
-        double input[INPUT_DIM];
-        for (int j = 0; j < INPUT_DIM; j++) {
-            input[j] = X_test[i][j];
-        }
-        double pred     = nn.predict(input);
-        double expected = basefunction(input, INPUT_DIM);
-        cout << "Input: [" << input[0] << ", " << input[1] << ", " << input[2]
-             << "] -> Predicción: " << pred
-             << " | Esperado: "    << expected << endl;
-    }
+    runner::print_metrics(test_mse);
+    runner::print_predictions_expected_basefunction(nn, X_test, 5);
     
     // Estadísticas del scheduler (light, heavy, NOPs, clock, fuera de ciclos)
     scheduler.print_stats();
