@@ -6,8 +6,7 @@
 #include <iostream>
 #include <vector>
 
-#include "nn_config.h"
-#include "nn_math.h"
+#include "nn_utils.h"
 
 namespace runner {
 

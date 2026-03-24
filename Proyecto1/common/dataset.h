@@ -5,7 +5,6 @@
 #include <string>
 #include <vector>
 
-// Carga dataset desde un txt con formato: x1 x2 x3 y
 inline bool loadDataset(const std::string& filename,
                         std::vector<std::vector<double>>& X,
                         std::vector<double>& Y) {

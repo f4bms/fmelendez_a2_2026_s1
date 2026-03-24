@@ -13,8 +13,7 @@
 #include <chrono>
 #include <iomanip>
 #include <random>
-#include "../../common/nn_config.h"
-#include "../../common/nn_math.h"
+#include "../../common/nn_utils.h"
 #include "../../common/dataset.h"
 
 using namespace std;
@@ -27,10 +26,18 @@ private:
     int num_threads;
     long long light_count;
     long long heavy_count;
+    long long fetch_count;
     long long stall_nop_count;
+    long long context_switch_count;
     long long total_multiplications;
     long long global_clock;
     int current_turn;
+
+    
+    static const long long LATENCY_LIGHT_DOT    = 1;   // forward: w*x  (pipelined, liviano)
+    static const long long LATENCY_LIGHT_ACT    = 1;   // (reservado para activaciones ligeras futuras)
+    static const long long LATENCY_HEAVY_DOT    = 3;   // backward: w*delta  (gradiente, pesado)
+    static const long long LATENCY_HEAVY_ACT    = 2;   // backward: t*t, error*deriv  (derivada de tanh, más costoso)
 
     mutex m;
     condition_variable cv;
@@ -38,17 +45,31 @@ private:
     bool phase_open;
 
     atomic<int> next_neuron;
-    static const int STALL_EVERY = 10000;
-    vector<int> thread_mul_counter;
+
+    // Pseudo-random determinista (stateless) para poder reproducir el mismo patrón
+    // de stalls entre ejecuciones y (eventualmente) entre esquemas.
+    static inline uint32_t random(uint32_t seed, uint32_t tag, int j, int k, OpType op) {
+        uint32_t x = seed;
+    // Constantes pequeñas para que sea fácil de seguir/explicar (aún determinista).
+    x ^= tag * 31u;
+    x ^= static_cast<uint32_t>(j) * 131u;
+    x ^= static_cast<uint32_t>(k) * 197u;
+        uint32_t opCode = (op == DOT_PRODUCT) ? 0u : 1u;
+    x ^= opCode * 7u;
+
+    x = (x ^ (x >> 13)) * 1274126177u;
+    x ^= (x >> 16);
+        return x;
+    }
 
 public:
     RoundRobinScheduler(int num_threads_arg, long long /*quantum_size*/ = 1)
     : num_threads(num_threads_arg),
-      light_count(0), heavy_count(0), stall_nop_count(0),
-      total_multiplications(0), global_clock(0), current_turn(0),
+    light_count(0), heavy_count(0), fetch_count(0), stall_nop_count(0),
+    context_switch_count(0),
+    total_multiplications(0), global_clock(0), current_turn(0),
       phase_done_count(0), phase_open(false),
-      next_neuron(0),
-      thread_mul_counter(num_threads_arg, 0) {}
+    next_neuron(0) {}
 
     void begin_phase() {
         next_neuron.store(0, memory_order_relaxed);
@@ -70,9 +91,28 @@ public:
     void advance_turn() {
         unique_lock<mutex> lock(m);
         global_clock++;
+        const int prev_turn = current_turn;
         current_turn = (current_turn + 1) % num_threads;
         cv.notify_all();
     }
+
+private:
+    void apply_context_switch_latency_locked(long long latency_cycles) {
+        if (num_threads <= 1) return;
+        context_switch_count++;
+        global_clock += latency_cycles;
+    }
+
+    // Selecciona la latencia correcta según si la operación es light/heavy y su OpType.
+    long long pick_latency(bool is_heavy, OpType op) const {
+        if (!is_heavy) {
+            return (op == ACTIVATION) ? LATENCY_LIGHT_ACT : LATENCY_LIGHT_DOT;
+        } else {
+            return (op == ACTIVATION) ? LATENCY_HEAVY_ACT : LATENCY_HEAVY_DOT;
+        }
+    }
+
+public:
 
     // Registra que este hilo terminó su trabajo, solo cierra la fase cuando ya todos terminaron
     void mark_done() {
@@ -85,6 +125,12 @@ public:
 
     // Toma el siguiente índice de neurona disponible y retorna -1 si no hay más
     int take_next(int total) {
+        // Simula el costo de hacer fetch de la cola (1 ciclo) y lo hace determinista.
+        {
+            lock_guard<mutex> lock(m);
+            fetch_count++;
+            global_clock += 1;
+        }
         int idx = next_neuron.fetch_add(1, memory_order_relaxed);
         return (idx < total) ? idx : -1;
     }
@@ -92,26 +138,68 @@ public:
     void count_light() { lock_guard<mutex> l(m); light_count++; }
     void count_heavy() { lock_guard<mutex> l(m); heavy_count++; }
 
+    // op indica si es una multiplicación de producto punto (DOT_PRODUCT) o
+    // parte del cómputo de activación (ACTIVATION), determinando la latencia de context switch.
     template <typename T>
-    T mul_light(T a, T b) {
-        count_light();
-        return a * b;
+    T mul_light(T a, T b, OpType op) {
+        lock_guard<mutex> lock(m);
+        light_count++;
+        global_clock++;
+        T r = a * b;
+        const int prev_turn = current_turn;
+        current_turn = (current_turn + 1) % num_threads;
+        if (num_threads > 1 && current_turn != prev_turn) {
+            apply_context_switch_latency_locked(pick_latency(false, op));
+        }
+        cv.notify_all();
+        return r;
     }
 
     template <typename T>
-    T mul_heavy(T a, T b) {
-        count_heavy();
-        return a * b;
+    T mul_heavy(T a, T b, OpType op) {
+        lock_guard<mutex> lock(m);
+        heavy_count++;
+        global_clock++;
+        T r = a * b;
+        const int prev_turn = current_turn;
+        current_turn = (current_turn + 1) % num_threads;
+        if (num_threads > 1 && current_turn != prev_turn) {
+            apply_context_switch_latency_locked(pick_latency(true, op));
+        }
+        cv.notify_all();
+        return r;
     }
-    //se toma turno(nop) si llegó al stall, retona dalso si el hilo debe de salir
-    bool check_stall(int thread_id) {
-        thread_mul_counter[thread_id]++;
-        if (thread_mul_counter[thread_id] >= STALL_EVERY) {
-            thread_mul_counter[thread_id] = 0;
-            if (!wait_turn(thread_id)) return false; // fase cerró → salir
-            { lock_guard<mutex> l(m); stall_nop_count++; }
+
+    // Simula stalls (misses) de memoria dependiendo del tipo de operación.
+    // Retorna false si la fase se cerró mientras el hilo esperaba su turno.
+    // tag/j/k identifican de forma determinista el "evento" (multiplicación lógica)
+    // para que el patrón de stalls sea reproducible y no dependa del scheduling.
+    bool check_stall(int thread_id, OpType op, uint32_t tag, int j, int k) {
+        double base_miss_rate = 2.0; // % base
+        double pressure = (op == DOT_PRODUCT) ? 1.2 : 0.3; // DOT_PRODUCT tiende a presionar más memoria
+        double miss_prob = base_miss_rate * pressure;      // % final
+
+    // Por ahora, mantenemos el patrón fijo por hilo (thread_id) para no cambiar
+    // las firmas de llamadas en todo el código. Si luego querés consistencia
+    // entre esquemas, se puede extender con (j,k) lógicos de la operación.
+    static constexpr uint32_t SEED = 42u;
+    (void)thread_id; // thread_id se mantiene por compatibilidad/telemetría
+    uint32_t pct = random(SEED, tag, j, k, op) % 100u;
+
+        // Importante: check_stall() se llama desde secciones donde el hilo YA obtuvo
+        // su turno vía wait_turn(thread_id). Volver a hacer wait_turn aquí puede
+        // bloquearse (deadlock) porque current_turn podría ya haber avanzado.
+        // En stall solo consumimos ciclos (NOP) y cedemos el turno.
+        if (pct < static_cast<uint32_t>(miss_prob)) {
+            {
+                lock_guard<mutex> l(m);
+                if (!phase_open) return false;
+                stall_nop_count++;
+                global_clock += 1; // penalidad fija por miss (ciclos)
+            }
             advance_turn();
         }
+
         return true;
     }
 
@@ -126,8 +214,10 @@ public:
     long long get_light_count()           const { return light_count; }
     long long get_heavy_count()           const { return heavy_count; }
     long long get_stall_nop_count()       const { return stall_nop_count; }
+    long long get_context_switch_count()  const { return context_switch_count; }
     long long get_total_multiplications() const { return total_multiplications; }
     long long get_global_clock()          const { return global_clock; }
+    long long get_fetch_count()           const { return fetch_count; }
     int       get_num_threads()           const { return num_threads; }
 
     void print_stats() {
@@ -135,8 +225,10 @@ public:
         cout << "\n --- metricas ---" << endl;
         cout << "mult light:  " << light_count          << endl;
         cout << "mult heavy:  " << heavy_count          << endl;
+    cout << "fetches (take_next): " << fetch_count     << endl;
         cout << "mult fuera de ciclos: " << total_multiplications << endl;
         cout << "total mult en ciclos: " << cycle_muls           << endl;
+        cout << "context switches:               " << context_switch_count  << endl;
         cout << "NOPs por stall:                   " << stall_nop_count      << endl;
         cout << "ciclos simulados:  " << global_clock         << endl;
         cout << "----------------------\n" << endl;
@@ -168,18 +260,14 @@ private:
     
 public:
     NeuralNetworkFineGrained(RoundRobinScheduler* sched) : scheduler(sched) {
-        // Semilla por red, evitando estado global compartido.
-        // random_device puede ser lento/no determinista; se mezcla con reloj para robustez.
-        std::random_device rd;
-        auto now = static_cast<unsigned>(
-            std::chrono::high_resolution_clock::now().time_since_epoch().count());
-        std::seed_seq seed{rd(), now, static_cast<unsigned>(reinterpret_cast<uintptr_t>(this))};
-        rng.seed(seed);
+    // Semilla fija para reproducibilidad entre ejecuciones.
+    // Si querés variabilidad controlada, podés convertirlo en parámetro desde main.
+    static constexpr uint32_t NN_SEED = 12345u;
+    rng.seed(NN_SEED);
         
         // base inicial de pesos de input a hidden
         for (int i = 0; i < INPUT_DIM; i++) {
             for (int j = 0; j < HIDDEN_NEURONS; j++) {
-                // equivalente a (rand/RAND_MAX - 0.5) * sqrt(2/input)
                 wh[i][j] = uniform_symmetric(0.5) * sqrt(2.0 / INPUT_DIM);
             }
         }
@@ -217,12 +305,9 @@ public:
             while (true) {
                 if (!scheduler->wait_turn(thread_id)) break;
 
-                //hace que se quede consistente hasta que terminen completamente todos los hilos
                 if (idle) {
                     scheduler->advance_turn();
 
-                /*este es una simulacion de un fetch
-                existe una cola de tareas que se procesan en orden y este se toma como un ciclo */
                 } else if (cur_neuron < 0) {
                     int j = scheduler->take_next(HIDDEN_NEURONS);
                     if (j < 0) {
@@ -235,22 +320,22 @@ public:
                     }
                     scheduler->advance_turn();
                 
-                /* este ya es el trabajo como tal de las multiplicaciones
-                se hace una multiplicacion por ciclo*/
                 } else {
-                    hidden_input[cur_neuron] += scheduler->mul_light(input[cur_dim], wh[cur_dim][cur_neuron]);
+                    // w * x: producto punto puro → DOT_PRODUCT
+                    hidden_input[cur_neuron] += scheduler->mul_light(input[cur_dim], wh[cur_dim][cur_neuron], DOT_PRODUCT);
+                    int stall_j = cur_neuron;
+                    int stall_k = cur_dim;
                     cur_dim++;
                     if (cur_dim >= INPUT_DIM) {
                         hidden_output[cur_neuron] = tanh_activation(hidden_input[cur_neuron]);
                         cur_neuron = -1;
                     }
                     scheduler->advance_turn();
-                    if (!scheduler->check_stall(thread_id)) break;
+                    if (!scheduler->check_stall(thread_id, DOT_PRODUCT, /*tag*/ 10u, stall_j, stall_k)) break;
                 }
             }
         };
 
-        //espera a que todos terminen antes de seguir 
         for (int t = 0; t < num_threads; t++) {
             threads.emplace_back(compute_hidden, t);
         }
@@ -283,16 +368,18 @@ public:
                     scheduler->advance_turn();
 
                 } else {
-                    output_input[cur_out] += scheduler->mul_light(hidden_output[cur_neuron], wo[cur_neuron][cur_out]);
+                    // hidden_out * wo: producto punto puro → DOT_PRODUCT
+                    output_input[cur_out] += scheduler->mul_light(hidden_output[cur_neuron], wo[cur_neuron][cur_out], DOT_PRODUCT);
+                    int stall_j = cur_neuron;
+                    int stall_k = cur_out;
                     cur_out++;
                     if (cur_out >= OUTPUT_DIM) cur_neuron = -1;
                     scheduler->advance_turn();
-                    if (!scheduler->check_stall(thread_id)) break;
+                    if (!scheduler->check_stall(thread_id, DOT_PRODUCT, /*tag*/ 20u, stall_j, stall_k)) break;
                 }
             }
         };
 
-        // termina de la capa de salida
         threads.clear();
         for (int t = 0; t < num_threads; t++) {
             threads.emplace_back(compute_output, t);
@@ -311,7 +398,7 @@ public:
     //BACKPROPAGATION ------------------------------------------------------------
     void backward_finegrained(const double input[], double target, double learning_rate) {
         
-        // Gradiente de MSE respetcto a la salida
+        // Gradiente de MSE respecto a la salida
         double output_delta[OUTPUT_DIM];
         for (int j = 0; j < OUTPUT_DIM; j++) {
             output_delta[j] = output[j] - target;
@@ -344,28 +431,31 @@ public:
                     scheduler->advance_turn();
 
                 } else if (cur_phase == 0) {
-                    // acumulando hidden_error — una mul por ciclo
-                    hidden_error[cur_neuron] += scheduler->mul_heavy(output_delta[cur_k], wo[cur_neuron][cur_k]);
+                    // acumulando hidden_error: output_delta * wo → producto punto de gradiente → DOT_PRODUCT
+                    hidden_error[cur_neuron] += scheduler->mul_heavy(output_delta[cur_k], wo[cur_neuron][cur_k], DOT_PRODUCT);
+                    int stall_j = cur_neuron;
+                    int stall_k = cur_k;
                     cur_k++;
                     if (cur_k >= OUTPUT_DIM) cur_phase = 1;
                     scheduler->advance_turn();
-                    if (!scheduler->check_stall(thread_id)) break;
+                    if (!scheduler->check_stall(thread_id, DOT_PRODUCT, /*tag*/ 30u, stall_j, stall_k)) break;
 
                 } else if (cur_phase == 1) {
-                    // mul t*t para la derivada de tanh
+                    // t*t para derivada de tanh: forma parte del cómputo de activación → ACTIVATION
                     double t = tanh(hidden_input[cur_neuron]);
-                    double tt = scheduler->mul_heavy(t, t);
-                    hidden_delta[cur_neuron] = 1.0 - tt; // guardamos deriv temporalmente
+                    double tt = scheduler->mul_heavy(t, t, ACTIVATION);
+                    hidden_delta[cur_neuron] = 1.0 - tt;
                     cur_phase = 2;
                     scheduler->advance_turn();
-                    if (!scheduler->check_stall(thread_id)) break;
+                    if (!scheduler->check_stall(thread_id, ACTIVATION, /*tag*/ 31u, /*j*/ cur_neuron, /*k*/ 0)) break;
 
                 } else {
-                    // mul hidden_error * deriv = hidden_delta
-                    hidden_delta[cur_neuron] = scheduler->mul_heavy(hidden_error[cur_neuron], hidden_delta[cur_neuron]);
+                    // hidden_error * deriv = hidden_delta: aplicar derivada de activación → ACTIVATION
+                    hidden_delta[cur_neuron] = scheduler->mul_heavy(hidden_error[cur_neuron], hidden_delta[cur_neuron], ACTIVATION);
+                    int stall_j = cur_neuron;
                     cur_neuron = -1;
                     scheduler->advance_turn();
-                    if (!scheduler->check_stall(thread_id)) break;
+                    if (!scheduler->check_stall(thread_id, ACTIVATION, /*tag*/ 32u, /*j*/ stall_j, /*k*/ 0)) break;
                 }
             }
         };
@@ -373,7 +463,7 @@ public:
         for (int t = 0; t < num_threads; t++) threads.emplace_back(compute_hidden_error, t);
         for (auto& t : threads) t.join();
 
-    // Actualización de pesos hidden -> output (equivalente a CGMT: mul_cgmt_heavy)
+    // Actualización de pesos hidden -> output
         scheduler->begin_phase();
         threads.clear();
         auto update_wo = [&](int thread_id) {
@@ -396,26 +486,27 @@ public:
                     scheduler->advance_turn();
 
                 } else {
-                    // WORK: una mul por ciclo — backward heavy
-                    double grad = scheduler->mul_heavy(output_delta[cur_out], hidden_output[cur_neuron]);
+                    // output_delta * hidden_output: gradiente de peso → DOT_PRODUCT
+                    double grad = scheduler->mul_heavy(output_delta[cur_out], hidden_output[cur_neuron], DOT_PRODUCT);
+                    int stall_j = cur_neuron;
+                    int stall_k = cur_out;
                     wo[cur_neuron][cur_out] -= scheduler->mul_total(learning_rate, grad);
                     cur_out++;
                     if (cur_out >= OUTPUT_DIM) cur_neuron = -1;
                     scheduler->advance_turn();
-                    if (!scheduler->check_stall(thread_id)) break;
+                    if (!scheduler->check_stall(thread_id, DOT_PRODUCT, /*tag*/ 40u, stall_j, stall_k)) break;
                 }
             }
         };
         for (int t = 0; t < num_threads; t++) threads.emplace_back(update_wo, t);
         for (auto& t : threads) t.join();
         
-    // Bias de salida (fuera de ciclos, igual que CGMT)
+    // Bias de salida (fuera de ciclos)
         for (int j = 0; j < OUTPUT_DIM; j++) {
-            // lr * delta (total)
             bo[j] -= scheduler->mul_total(learning_rate, output_delta[j]);
         }
         
-    // Actualización de pesos input -> hidden (equivalente a CGMT: mul_cgmt_heavy)
+    // Actualización de pesos input -> hidden
         scheduler->begin_phase();
         threads.clear();
         auto update_wh = [&](int thread_id) {
@@ -438,20 +529,22 @@ public:
                     scheduler->advance_turn();
 
                 } else {
-                    // WORK: una mul por ciclo — backward heavy
-                    double grad = scheduler->mul_heavy(hidden_delta[cur_neuron], input[cur_dim]);
+                    // hidden_delta * input: gradiente de peso → DOT_PRODUCT
+                    double grad = scheduler->mul_heavy(hidden_delta[cur_neuron], input[cur_dim], DOT_PRODUCT);
+                    int stall_j = cur_neuron;
+                    int stall_k = cur_dim;
                     wh[cur_dim][cur_neuron] -= scheduler->mul_total(learning_rate, grad);
                     cur_dim++;
                     if (cur_dim >= INPUT_DIM) cur_neuron = -1;
                     scheduler->advance_turn();
-                    if (!scheduler->check_stall(thread_id)) break;
+                    if (!scheduler->check_stall(thread_id, DOT_PRODUCT, /*tag*/ 50u, stall_j, stall_k)) break;
                 }
             }
         };
         for (int t = 0; t < num_threads; t++) threads.emplace_back(update_wh, t);
         for (auto& t : threads) t.join();
         
-    // Bias de capa oculta (fuera de ciclos, igual que CGMT)
+    // Bias de capa oculta (fuera de ciclos)
         for (int j = 0; j < HIDDEN_NEURONS; j++) {
             bh[j] -= scheduler->mul_total(learning_rate, hidden_delta[j]);
         }

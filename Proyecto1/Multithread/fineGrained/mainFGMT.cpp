@@ -3,7 +3,16 @@
    El stall se simula cada 10 multiplicaciones por hilo → NOP + cede turno. */
 #include "algorythmFGMT.cpp"
 
-#include "../../common/runner.h"
+#include <filesystem>
+
+static bool tryLoadDataset(const std::string& path,
+                           std::vector<std::vector<double>>& X,
+                           std::vector<double>& Y) {
+    X.clear();
+    Y.clear();
+    loadDataset(path, X, Y);
+    return !X.empty();
+}
 
 int main(int argc, char* argv[]) {
     int num_threads = 2;
@@ -20,16 +29,43 @@ int main(int argc, char* argv[]) {
     // Cargar dataset
     vector<vector<double>> X_all;
     vector<double> Y_all;
-    if (!loadDataset("../dataset.txt", X_all, Y_all) || X_all.empty()) {
-        cerr << "Error: dataset vacío o no encontrado." << endl;
+
+    // Ruta robusta: intenta resolver relativo al ejecutable y también algunos fallbacks.
+    namespace fs = std::filesystem;
+    fs::path exeDir = (argc > 0 && argv[0]) ? fs::absolute(fs::path(argv[0])).parent_path() : fs::current_path();
+
+    std::vector<fs::path> candidates = {
+        exeDir / "../../dataset.txt",                  // ejecución desde fineGrained/
+        exeDir / "../dataset.txt",                     // ejecución desde Multithread/
+        exeDir / "dataset.txt",                        // ejecución con dataset junto al binario
+        fs::current_path() / "dataset.txt",            // cwd tiene dataset
+        fs::current_path() / "Proyecto1/dataset.txt",  // ejecución desde raíz del repo
+        fs::current_path() / "../dataset.txt",         // ejecución desde ./Multithread/fineGrained
+    };
+
+    bool loaded = false;
+    for (const auto& p : candidates) {
+        if (tryLoadDataset(p.lexically_normal().string(), X_all, Y_all)) {
+            cout << "Dataset cargado desde: " << p.lexically_normal().string() << endl;
+            loaded = true;
+            break;
+        }
+    }
+
+    if (!loaded) {
+        cerr << "Error: dataset vacío o no encontrado. Candidatos probados:" << endl;
+        for (const auto& p : candidates) {
+            cerr << "  - " << p.lexically_normal().string() << endl;
+        }
         return 1;
     }
 
-    auto split = split_train_test(X_all, Y_all, 0.8);
-    auto& X_train = split.X_train;
-    auto& Y_train = split.Y_train;
-    auto& X_test  = split.X_test;
-    auto& Y_test  = split.Y_test;
+    // 80% entrenamiento, 20% pruebas
+    int n_train = (int)(X_all.size() * 0.8);
+    vector<vector<double>> X_train(X_all.begin(), X_all.begin() + n_train);
+    vector<double> Y_train(Y_all.begin(), Y_all.begin() + n_train);
+    vector<vector<double>> X_test(X_all.begin() + n_train, X_all.end());
+    vector<double> Y_test(Y_all.begin() + n_train, Y_all.end());
     
     cout << "Entrenamiento: " << X_train.size() << " muestras" << endl;
     cout << "Pruebas:       " << X_test.size()  << " muestras\n" << endl;
@@ -51,8 +87,22 @@ int main(int argc, char* argv[]) {
     // Evaluación
     cout << "\n Evaluación del modelo" << endl;
     double test_mse = nn.evaluate(X_test, Y_test);
-    runner::print_metrics(test_mse);
-    runner::print_predictions_expected_basefunction(nn, X_test, 5);
+    cout << "Test MSE:  " << fixed << setprecision(6) << test_mse << endl;
+    cout << "Test RMSE: " << sqrt(test_mse) << endl;
+    
+    // Algunas predicciones para verificar funcionamiento
+    cout << "\nMuestras de predicción:" << endl;
+    for (int i = 0; i < min(5, (int)X_test.size()); i++) {
+        double input[INPUT_DIM];
+        for (int j = 0; j < INPUT_DIM; j++) {
+            input[j] = X_test[i][j];
+        }
+        double pred     = nn.predict(input);
+        double expected = basefunction(input, INPUT_DIM);
+        cout << "Input: [" << input[0] << ", " << input[1] << ", " << input[2]
+             << "] -> Predicción: " << pred
+             << " | Esperado: "    << expected << endl;
+    }
     
     // Estadísticas del scheduler (light, heavy, NOPs, clock, fuera de ciclos)
     scheduler.print_stats();

@@ -10,8 +10,7 @@
 #include <atomic>
 #include <algorithm>
 
-#include "../common/nn_config.h"
-#include "../common/nn_math.h"
+#include "../common/nn_utils.h"
 #include "../common/dataset.h"
 
 using namespace std;
