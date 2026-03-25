@@ -64,8 +64,9 @@ private:
 	int phase_done_count;
 	vector<bool> thread_done;
 
-	// Asignación de trabajo por cola (igual que FGMT): cada hilo toma el siguiente índice.
-	std::atomic<int> next_index;
+	// Nota: antes había asignación dinámica por cola (next_index / take_next).
+	// En esta versión el reparto de trabajo es estático por hilo (strided) en la NN,
+	// así que el scheduler no administra índices de trabajo.
 	// Nota: en la versión anterior había un PRNG por hilo y un umbral aleatorio
 	// para disparar stalls. Ahora usamos el mismo criterio que FGMT:
 	// probabilístico por OpType, determinista por evento (tag,j,k).
@@ -126,29 +127,16 @@ public:
 		  compute_multiplications(0), total_multiplications(0),
 		  stall_count(0), stall_events_on_heavy_count(0), context_switch_count(0), fetch_count(0), nop_count(0),
 		  global_clock(0), current_active_thread(0), phase_open(false),
-		  phase_done_count(0), thread_done(num_threads_arg, false), next_index(0) {
+		  phase_done_count(0), thread_done(num_threads_arg, false) {
 	}
 
 	void begin_phase() {
 		unique_lock<mutex> lock(m);
-		next_index.store(0, std::memory_order_relaxed);
 		phase_open = true;
 		phase_done_count = 0;
 		current_active_thread = 0;
 		fill(thread_done.begin(), thread_done.end(), false);
 		cv.notify_all();
-	}
-
-	// Toma el siguiente índice de trabajo disponible. Retorna -1 si ya no hay más.
-	int take_next(int total) {
-		// Simula el costo de hacer fetch de la cola (1 ciclo).
-		{
-			lock_guard<mutex> lock(m);
-			fetch_count++;
-			global_clock += 1;
-		}
-		int idx = next_index.fetch_add(1, std::memory_order_relaxed);
-		return (idx < total) ? idx : -1;
 	}
 
 	void mark_done(int thread_id) {
@@ -299,18 +287,17 @@ public:
 	}
 
 	void print_stats() {
-		cout << "\n --- metricas CGMT ---" << endl;
-		cout << "multiplicaciones/ciclos (livianas+pesadas): " << compute_multiplications << endl;
-		cout << "  - livianas/ciclos: " << cycle_mul_light_count << endl;
-		cout << "  - pesadas/ciclos: " << cycle_mul_heavy_count << endl;
+		long long cycle_muls = cycle_mul_light_count + cycle_mul_heavy_count;
+		cout << "\n --- metricas ---" << endl;
+		cout << "mult light:  " << cycle_mul_light_count << endl;
+		cout << "mult heavy:  " << cycle_mul_heavy_count << endl;
 		cout << "fetches (take_next): " << fetch_count << endl;
-		cout << "multiplicaciones no contadas (registradas): " << uncounted_mul_count << endl;
-		cout << "multiplicaciones totales (registradas): " << total_multiplications << endl;
-		cout << "stalls (prob por OpType, determinista por evento): " << stall_count << endl;
-		cout << "context switch (la mayoria en stalls): " << context_switch_count << endl;
-		cout << "NOPs: " << nop_count << endl;
-		cout << "ciclos simulados: " << global_clock << endl;
-		cout << "-----------------------\n" << endl;
+		cout << "mult fuera de ciclos: " << uncounted_mul_count << endl;
+		cout << "total mult en ciclos: " << cycle_muls << endl;
+		cout << "context switches:               " << context_switch_count << endl;
+		cout << "NOPs por stall:                   " << stall_count << endl;
+		cout << "ciclos simulados:  " << global_clock << endl;
+		cout << "----------------------\n" << endl;
 	}
 };
 
@@ -356,19 +343,14 @@ public:
 		// Capa oculta
 		scheduler->begin_phase();
 		auto compute_hidden = [&](int tid) {
-			while (scheduler->is_phase_open()) {
-				int j = scheduler->take_next(HIDDEN_NEURONS);
-				if (j >= 0) {
-					hidden_input[j] = bh[j];
-					for (int i = 0; i < INPUT_DIM; i++) {
-						hidden_input[j] += scheduler->mul_cgmt_light(tid, input[i], wh[i][j], DOT_PRODUCT, 10u, j, i);
-					}
-					hidden_output[j] = tanh_activation(hidden_input[j]);
-				} else {
-					scheduler->mark_done(tid);
-					scheduler->idle_cgmt(tid);
+			for (int j = tid; j < HIDDEN_NEURONS; j += num_threads) {
+				hidden_input[j] = bh[j];
+				for (int i = 0; i < INPUT_DIM; i++) {
+					hidden_input[j] += scheduler->mul_cgmt_light(tid, input[i], wh[i][j], DOT_PRODUCT, 10u, j, i);
 				}
+				hidden_output[j] = tanh_activation(hidden_input[j]);
 			}
+			scheduler->mark_done(tid);
 		};
 
 		for (int t = 0; t < num_threads; t++) threads.emplace_back(compute_hidden, t);
@@ -380,17 +362,12 @@ public:
 
 		threads.clear();
 		auto compute_output = [&](int tid) {
-			while (scheduler->is_phase_open()) {
-				int i = scheduler->take_next(HIDDEN_NEURONS);
-				if (i >= 0) {
-					for (int outj = 0; outj < OUTPUT_DIM; outj++) {
-						output_input[outj] += scheduler->mul_cgmt_light(tid, hidden_output[i], wo[i][outj], DOT_PRODUCT, 20u, i, outj);
-					}
-				} else {
-					scheduler->mark_done(tid);
-					scheduler->idle_cgmt(tid);
+			for (int i = tid; i < HIDDEN_NEURONS; i += num_threads) {
+				for (int outj = 0; outj < OUTPUT_DIM; outj++) {
+					output_input[outj] += scheduler->mul_cgmt_light(tid, hidden_output[i], wo[i][outj], DOT_PRODUCT, 20u, i, outj);
 				}
 			}
+			scheduler->mark_done(tid);
 		};
 
 		for (int t = 0; t < num_threads; t++) threads.emplace_back(compute_output, t);
@@ -414,20 +391,20 @@ public:
 		// Cálculo de hidden_error y hidden_delta
 		scheduler->begin_phase();
 		auto compute_hidden_error = [&](int tid) {
-			while (scheduler->is_phase_open()) {
-				int j = scheduler->take_next(HIDDEN_NEURONS);
-				if (j >= 0) {
-					hidden_error[j] = 0.0;
-					for (int k = 0; k < OUTPUT_DIM; k++) {
-						hidden_error[j] += scheduler->mul_cgmt_heavy(tid, output_delta[k], wo[j][k], DOT_PRODUCT, 30u, j, k);
-					}
-					double deriv = tanh_derivative(hidden_input[j]);
-					hidden_delta[j] = scheduler->mul_cgmt_heavy(tid, hidden_error[j], deriv, ACTIVATION, 31u, j, 0);
-				} else {
-					scheduler->mark_done(tid);
-					scheduler->idle_cgmt(tid);
+			for (int j = tid; j < HIDDEN_NEURONS; j += num_threads) {
+				hidden_error[j] = 0.0;
+				for (int k = 0; k < OUTPUT_DIM; k++) {
+					hidden_error[j] += scheduler->mul_cgmt_heavy(tid, output_delta[k], wo[j][k], DOT_PRODUCT, 30u, j, k);
 				}
+
+				// Igual que FGMT: derivada tanh modelada como 2 multiplicaciones "heavy" de tipo ACTIVATION.
+				// 1) tt = t * t
+				double t = tanh(hidden_input[j]);
+				double tt = scheduler->mul_cgmt_heavy(tid, t, t, ACTIVATION, 31u, j, 0);
+				// 2) hidden_delta = hidden_error * (1 - tt)
+				hidden_delta[j] = scheduler->mul_cgmt_heavy(tid, hidden_error[j], (1.0 - tt), ACTIVATION, 32u, j, 0);
 			}
+			scheduler->mark_done(tid);
 		};
 
 		for (int t = 0; t < num_threads; t++) threads.emplace_back(compute_hidden_error, t);
@@ -437,18 +414,13 @@ public:
 		scheduler->begin_phase();
 		threads.clear();
 		auto update_wo = [&](int tid) {
-			while (scheduler->is_phase_open()) {
-				int i = scheduler->take_next(HIDDEN_NEURONS);
-				if (i >= 0) {
-					for (int j = 0; j < OUTPUT_DIM; j++) {
-						double grad = scheduler->mul_cgmt_heavy(tid, output_delta[j], hidden_output[i], DOT_PRODUCT, 40u, i, j);
-						wo[i][j] -= scheduler->mul_total(learning_rate, grad);
-					}
-				} else {
-					scheduler->mark_done(tid);
-					scheduler->idle_cgmt(tid);
+			for (int i = tid; i < HIDDEN_NEURONS; i += num_threads) {
+				for (int j = 0; j < OUTPUT_DIM; j++) {
+					double grad = scheduler->mul_cgmt_heavy(tid, output_delta[j], hidden_output[i], DOT_PRODUCT, 40u, i, j);
+					wo[i][j] -= scheduler->mul_total(learning_rate, grad);
 				}
 			}
+			scheduler->mark_done(tid);
 		};
 		for (int t = 0; t < num_threads; t++) threads.emplace_back(update_wo, t);
 		for (auto& t : threads) t.join();
@@ -460,18 +432,13 @@ public:
 		scheduler->begin_phase();
 		threads.clear();
 		auto update_wh = [&](int tid) {
-			while (scheduler->is_phase_open()) {
-				int j = scheduler->take_next(HIDDEN_NEURONS);
-				if (j >= 0) {
-					for (int i = 0; i < INPUT_DIM; i++) {
-						double grad = scheduler->mul_cgmt_heavy(tid, hidden_delta[j], input[i], DOT_PRODUCT, 50u, j, i);
-						wh[i][j] -= scheduler->mul_total(learning_rate, grad);
-					}
-				} else {
-					scheduler->mark_done(tid);
-					scheduler->idle_cgmt(tid);
+			for (int j = tid; j < HIDDEN_NEURONS; j += num_threads) {
+				for (int i = 0; i < INPUT_DIM; i++) {
+					double grad = scheduler->mul_cgmt_heavy(tid, hidden_delta[j], input[i], DOT_PRODUCT, 50u, j, i);
+					wh[i][j] -= scheduler->mul_total(learning_rate, grad);
 				}
 			}
+			scheduler->mark_done(tid);
 		};
 		for (int t = 0; t < num_threads; t++) threads.emplace_back(update_wh, t);
 		for (auto& t : threads) t.join();

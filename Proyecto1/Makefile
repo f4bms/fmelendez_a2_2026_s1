@@ -1,6 +1,10 @@
 CXX := g++
 CXXFLAGS := -O2 -std=c++17 -pthread
 
+# Parametrización
+THREADS ?= 2
+RUNS ?= 1
+
 ROOT := .
 RESULTS_DIR := $(ROOT)/results
 
@@ -20,6 +24,49 @@ results_dir:
 build: $(FGMT_BIN)
 
 cgmt_build: $(CGMT_BIN)
+
+# Ejecuta una vez y guarda métricas en CSV (en cwd del binario).
+.PHONY: metrics metrics_fgmt metrics_cgmt
+
+metrics: metrics_fgmt metrics_cgmt
+
+metrics_fgmt: build results_dir
+	@mkdir -p $(RESULTS_DIR)
+	@touch $(RESULTS_DIR)/metrics.csv
+	@cd $(abspath $(FGMT_DIR)) && rm -f metrics.csv && ./main_fgmt $(THREADS)
+	@{ \
+		if [ ! -s "$(RESULTS_DIR)/metrics.csv" ]; then \
+			cat "$(FGMT_DIR)/metrics.csv"; \
+		else \
+			tail -n +2 "$(FGMT_DIR)/metrics.csv"; \
+		fi; \
+	} >> $(RESULTS_DIR)/metrics.csv
+	@rm -f $(FGMT_DIR)/metrics.csv
+
+metrics_cgmt: cgmt_build results_dir
+	@mkdir -p $(RESULTS_DIR)
+	@touch $(RESULTS_DIR)/metrics.csv
+	@cd $(abspath $(CGMT_DIR)) && rm -f metrics.csv && ./main_cgmt $(THREADS)
+	@{ \
+		if [ ! -s "$(RESULTS_DIR)/metrics.csv" ]; then \
+			cat "$(CGMT_DIR)/metrics.csv"; \
+		else \
+			tail -n +2 "$(CGMT_DIR)/metrics.csv"; \
+		fi; \
+	} >> $(RESULTS_DIR)/metrics.csv
+	@rm -f $(CGMT_DIR)/metrics.csv
+
+.PHONY: metrics_all
+metrics_all: build cgmt_build results_dir
+	@$(MAKE) metrics_fgmt
+	@$(MAKE) metrics_cgmt
+
+.PHONY: metrics_runs
+metrics_runs: build cgmt_build results_dir
+	@for i in $$(seq 1 $(RUNS)); do \
+		$(MAKE) THREADS=$(THREADS) metrics_fgmt; \
+		$(MAKE) THREADS=$(THREADS) metrics_cgmt; \
+	done
 
 $(FGMT_BIN): $(FGMT_DIR)/mainFGMT.cpp $(FGMT_DIR)/algorythmFGMT.cpp $(ROOT)/common/runner.h $(ROOT)/common/nn_utils.h $(ROOT)/common/dataset.h
 	$(CXX) $(CXXFLAGS) -o $@ $(FGMT_DIR)/mainFGMT.cpp

@@ -1,0 +1,10 @@
+tipo,cant_threads,input_dim,hidden_neurons,output_dim,epochs,dataset_elements,total_mult_en_ciclos,nops_stalls,ciclos_simulados,context_switches,tiempo_ejecucion_s
+fgmt,2,3,30,1,1,2,450,11,1271,450,0.000327
+cgmt,2,3,30,1,1,2,450,11,514,9,0.000289
+fgmt,2,3,30,1,1,2,450,11,1271,450,0.000530
+fgmt,2,3,30,1,1,2,450,11,1271,450,0.000616
+fgmt,2,3,30,1,1,2,450,11,1271,450,0.000942
+fgmt,2,3,30,1,1,2,450,11,1271,450,0.000649
+fgmt,2,3,30,1,1,2,450,11,1271,450,0.000796
+fgmt,2,3,30,1,1,2,450,11,1271,450,0.000724
+fgmt,2,3,30,1,1,2,450,11,1271,450,0.000806
