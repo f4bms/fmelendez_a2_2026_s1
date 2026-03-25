@@ -1,7 +1,6 @@
 CXX := g++
 CXXFLAGS := -O2 -std=c++17 -pthread
 
-# Parametrización
 THREADS ?= 2
 RUNS ?= 1
 
@@ -13,8 +12,10 @@ CGMT_DIR := $(ROOT)/Multithread/coarseGrained
 
 FGMT_BIN := $(FGMT_DIR)/main_fgmt
 CGMT_BIN := $(CGMT_DIR)/main_cgmt
+NORMAL_DIR := $(ROOT)/NormalExec
+NORMAL_BIN := $(NORMAL_DIR)/main_normal
 
-.PHONY: all clean results_dir build run50 cgmt_build cgmt_run50
+.PHONY: all clean results_dir build run50 cgmt_build cgmt_run50 normal_build
 
 all: build
 
@@ -25,10 +26,12 @@ build: $(FGMT_BIN)
 
 cgmt_build: $(CGMT_BIN)
 
+normal_build: $(NORMAL_BIN)
+
 # Ejecuta una vez y guarda métricas en CSV (en cwd del binario).
 .PHONY: metrics metrics_fgmt metrics_cgmt
 
-metrics: metrics_fgmt metrics_cgmt
+metrics: metrics_fgmt metrics_cgmt metrics_normal
 
 metrics_fgmt: build results_dir
 	@mkdir -p $(RESULTS_DIR)
@@ -56,16 +59,31 @@ metrics_cgmt: cgmt_build results_dir
 	} >> $(RESULTS_DIR)/metrics.csv
 	@rm -f $(CGMT_DIR)/metrics.csv
 
+metrics_normal: normal_build results_dir
+	@mkdir -p $(RESULTS_DIR)
+	@touch $(RESULTS_DIR)/metrics.csv
+	@cd $(abspath $(NORMAL_DIR)) && rm -f metrics.csv && ./main_normal
+	@{ \
+		if [ ! -s "$(RESULTS_DIR)/metrics.csv" ]; then \
+			cat "$(NORMAL_DIR)/metrics.csv"; \
+		else \
+			tail -n +2 "$(NORMAL_DIR)/metrics.csv"; \
+		fi; \
+	} >> $(RESULTS_DIR)/metrics.csv
+	@rm -f $(NORMAL_DIR)/metrics.csv
+
 .PHONY: metrics_all
-metrics_all: build cgmt_build results_dir
+metrics_all: build cgmt_build normal_build results_dir
 	@$(MAKE) metrics_fgmt
 	@$(MAKE) metrics_cgmt
+	@$(MAKE) metrics_normal
 
 .PHONY: metrics_runs
-metrics_runs: build cgmt_build results_dir
+metrics_runs: build cgmt_build normal_build results_dir
 	@for i in $$(seq 1 $(RUNS)); do \
 		$(MAKE) THREADS=$(THREADS) metrics_fgmt; \
 		$(MAKE) THREADS=$(THREADS) metrics_cgmt; \
+		$(MAKE) metrics_normal; \
 	done
 
 $(FGMT_BIN): $(FGMT_DIR)/mainFGMT.cpp $(FGMT_DIR)/algorythmFGMT.cpp $(ROOT)/common/runner.h $(ROOT)/common/nn_utils.h $(ROOT)/common/dataset.h
@@ -73,6 +91,9 @@ $(FGMT_BIN): $(FGMT_DIR)/mainFGMT.cpp $(FGMT_DIR)/algorythmFGMT.cpp $(ROOT)/comm
 
 $(CGMT_BIN): $(CGMT_DIR)/mainCGMT.cpp $(CGMT_DIR)/algorythmCGMT.cpp $(ROOT)/common/nn_utils.h $(ROOT)/common/dataset.h
 	$(CXX) $(CXXFLAGS) -o $@ $(CGMT_DIR)/mainCGMT.cpp
+
+$(NORMAL_BIN): $(NORMAL_DIR)/main.cpp $(NORMAL_DIR)/algorythm.cpp $(ROOT)/common/runner.h $(ROOT)/common/nn_utils.h $(ROOT)/common/dataset.h
+	$(CXX) $(CXXFLAGS) -o $@ $(NORMAL_DIR)/main.cpp
 
 
 run50: build results_dir
@@ -96,4 +117,5 @@ cgmt_run50: cgmt_build results_dir
 clean:
 	@rm -f $(FGMT_BIN)
 	@rm -f $(CGMT_BIN)
+	@rm -f $(NORMAL_BIN)
 	@rm -rf $(RESULTS_DIR)

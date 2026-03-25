@@ -24,6 +24,7 @@ using namespace std::chrono;
 class RoundRobinScheduler {
 private:
     int num_threads;
+    long long context_switch_penalty_cycles;
     long long light_count;
     long long heavy_count;
     long long light_dot_count;
@@ -64,8 +65,9 @@ private:
     }
 
 public:
-    RoundRobinScheduler(int num_threads_arg, long long /*quantum_size*/ = 1)
+    RoundRobinScheduler(int num_threads_arg, long long context_switch_penalty_cycles_arg = 1)
     : num_threads(num_threads_arg),
+    context_switch_penalty_cycles(context_switch_penalty_cycles_arg),
     light_count(0), heavy_count(0),
     light_dot_count(0), light_act_count(0),
     heavy_dot_count(0), heavy_act_count(0),
@@ -118,10 +120,10 @@ public:
     }
 
 private:
-    void apply_context_switch_latency_locked(long long latency_cycles) {
+    void apply_context_switch_latency_locked() {
         if (num_threads <= 1) return;
         context_switch_count++;
-        global_clock += latency_cycles;
+        global_clock += context_switch_penalty_cycles;
     }
 
     // Selecciona la latencia correcta según si la operación es light/heavy y su OpType.
@@ -153,7 +155,7 @@ public:
         const int prev_turn = current_turn;
         current_turn = (current_turn + 1) % num_threads;
         if (num_threads > 1 && current_turn != prev_turn) {
-            apply_context_switch_latency_locked(pick_latency(false, op));
+            apply_context_switch_latency_locked();
         }
         cv.notify_all();
         return r;
@@ -170,7 +172,7 @@ public:
         const int prev_turn = current_turn;
         current_turn = (current_turn + 1) % num_threads;
         if (num_threads > 1 && current_turn != prev_turn) {
-            apply_context_switch_latency_locked(pick_latency(true, op));
+            apply_context_switch_latency_locked();
         }
         cv.notify_all();
         return r;
@@ -181,26 +183,23 @@ public:
     // tag/j/k identifican de forma determinista el "evento" (multiplicación lógica)
     // para que el patrón de stalls sea reproducible y no dependa del scheduling.
     bool check_stall(int thread_id, OpType op, uint32_t tag, int j, int k) {
-        double base_miss_rate = 2.0; // % base
-        double pressure = (op == DOT_PRODUCT) ? 1.2 : 0.3; // DOT_PRODUCT tiende a presionar más memoria
-        double miss_prob = base_miss_rate * pressure;      // % final
+        // DOT_PRODUCT: alta presión de memoria → mayor probabilidad y stall más largo.
+        // ACTIVATION: compute-bound → menor probabilidad y stall corto.
+        double miss_prob    = (op == DOT_PRODUCT) ? 2.4 : 0.6;  // %
+        long long stall_lat = (op == DOT_PRODUCT) ? 8LL  : 3LL; // ciclos del stall
 
-    // Por ahora, mantenemos el patrón fijo por hilo (thread_id) para no cambiar
-    // las firmas de llamadas en todo el código. Si luego querés consistencia
-    // entre esquemas, se puede extender con (j,k) lógicos de la operación.
-    static constexpr uint32_t SEED = 42u;
-    (void)thread_id; // thread_id se mantiene por compatibilidad/telemetría
-    uint32_t pct = random(SEED, tag, j, k, op) % 100u;
+        static constexpr uint32_t SEED = 42u;
+        (void)thread_id;
+        uint32_t pct = random(SEED, tag, j, k, op) % 100u;
 
-        // Importante: check_stall() se llama desde secciones donde el hilo YA obtuvo
-        // su turno vía wait_turn(thread_id). Volver a hacer wait_turn aquí puede
-        // bloquearse (deadlock) porque current_turn podría ya haber avanzado.
-        // En stall solo consumimos ciclos (NOP) y cedemos el turno.
         if (pct < static_cast<uint32_t>(miss_prob)) {
             lock_guard<mutex> l(m);
             if (!phase_open) return false;
             stall_nop_count++;
-            global_clock += 1; // penalidad fija por miss (ciclos)
+            // FGMT: el pipeline siempre tiene num_threads slots. Un hilo terminado
+            // ocupa su slot con NOPs, así que la capacidad de absorción es siempre num_threads-1.
+            long long absorbed = std::min(stall_lat, (long long)(num_threads - 1));
+            global_clock += std::max(0LL, stall_lat - absorbed);
         }
 
         return true;

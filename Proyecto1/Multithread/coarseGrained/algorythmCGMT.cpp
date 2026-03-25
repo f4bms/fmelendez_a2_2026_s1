@@ -217,34 +217,26 @@ public:
 		}
 
 			// CGMT NO cambia de hilo salvo que ocurra stall.
-			// Mismo criterio probabilístico por operación que FGMT + determinismo por evento.
-			double base_miss_rate = 2.0; // % base
-			double pressure = (op == DOT_PRODUCT) ? 1.2 : 0.3;
-			double miss_prob = base_miss_rate * pressure; // % final
+			// Mismas probabilidades y latencias que FGMT, pero sin hiding (se paga completo).
+			double miss_prob    = (op == DOT_PRODUCT) ? 2.4 : 0.6;  // %
+			long long stall_lat = (op == DOT_PRODUCT) ? 8LL  : 3LL; // ciclos del stall
 			static constexpr uint32_t SEED = 42u;
 			uint32_t pct = random(SEED, tag, j, k, op) % 100u;
 			if (pct < static_cast<uint32_t>(miss_prob)) {
 				stall_count++;
 				if (is_heavy) stall_events_on_heavy_count++;
 
-				// Costo del stall: igual que FGMT (penalidad fija = 1 ciclo),
-				// más la latencia configurable si se quiere modelar adicional.
-				global_clock += 1;
-				if (stall_latency_cycles > 0) {
-					global_clock += stall_latency_cycles;
-				}
-
-				// Al haber stall, este scheduler hace context switch SIEMPRE (si hay otro hilo vivo).
 				int old = current_active_thread;
 				if (unfinished_threads_locked() > 1) {
+					// Hay otro hilo disponible: paga stall_lat + context_switch_penalty.
 					switch_to_next_thread_locked();
 					if (current_active_thread != old) {
 						context_switch_count++;
-						global_clock += pick_latency(is_heavy, op);
-						if (context_switch_penalty_cycles > 0) {
-							global_clock += context_switch_penalty_cycles;
-						}
+						global_clock += stall_lat + context_switch_penalty_cycles;
 					}
+				} else {
+					// Solo 1 hilo activo: solo paga el stall completo (sin switch).
+					global_clock += stall_lat;
 				}
 				cv.notify_all();
 			}
