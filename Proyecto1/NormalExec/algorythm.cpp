@@ -1,42 +1,30 @@
 //algoritmo de entrenamiento basico sin hilos
 
 #include <iostream>
-#include <fstream>
-#include <cmath>
 #include <cstdlib>
 #include <ctime>
 #include <vector>
+#include <cstdint>
+
+#include "../common/nn_utils.h"
+#include "../common/dataset.h"
 
 using namespace std;
 
-// Constantes de la red neuronal
-
-const int INPUT_DIM = 3;
-const int HIDDEN_NEURONS = 30;
-const int OUTPUT_DIM = 1;
-const double LEARNING_RATE = 0.08;
-const int EPOCHS = 1500;
-
-//se crea la funcion basefunction que espera un arreglo de datos y su dimension
-double basefunction(double x[], int d){
-    double sum = 0;
-    for(int i=0;i<d;i++){
-        sum += sin(x[i]) + 0.3*x[i]*x[i];
-    }
-    return sum;
+// Utilidad para simular stalls de memoria de forma determinista por evento (tag,j,k) y OpType.
+// Misma idea que en FGMT/CGMT: probabilidad por tipo de operación, pero el resultado no depende
+// del orden de ejecución (stateless).
+static inline uint32_t random_det(uint32_t seed, uint32_t tag, int j, int k, OpType op) {
+    uint32_t x = seed;
+    x ^= tag * 31u;
+    x ^= static_cast<uint32_t>(j) * 131u;
+    x ^= static_cast<uint32_t>(k) * 197u;
+    uint32_t opCode = (op == DOT_PRODUCT) ? 0u : 1u;
+    x ^= opCode * 7u;
+    x = (x ^ (x >> 13)) * 1274126177u;
+    x ^= (x >> 16);
+    return x;
 }
-
-// Función de activación tanh
-double tanh_activation(double x) {
-    return tanh(x);
-}
-
-// Derivada de tanh
-double tanh_derivative(double x) {
-    double t = tanh(x);
-    return 1.0 - t * t;
-}
-
 
 class NeuralNetwork {
 private:
@@ -50,6 +38,56 @@ private:
     double hidden_output[HIDDEN_NEURONS];  // Salida de capa oculta (después de activación)
     double output_input[OUTPUT_DIM];       // Entrada a capa de salida
     double output[OUTPUT_DIM];             // Salida final
+
+    // --- Métricas de simulación (sin hilos) ---
+    long long cycle_mul_light_count = 0;
+    long long cycle_mul_heavy_count = 0;
+    long long cycle_mul_count = 0;   // total en ciclos (light+heavy)
+    long long total_multiplications = 0; // fuera de ciclos (lr*grad, error^2, etc.)
+    long long stall_count = 0;       // cantidad de stalls (NOPs por miss)
+    long long global_clock = 0;      // ciclos simulados = cycle_mul_count + stalls (y lo que se modele)
+
+    template <typename T>
+    inline T mul_impl(T a, T b, bool is_heavy, OpType op, uint32_t tag, int j, int k) {
+        // 1 multiplicación = 1 ciclo de cómputo
+        cycle_mul_count++;
+        global_clock++;
+
+        if (is_heavy) cycle_mul_heavy_count++;
+        else          cycle_mul_light_count++;
+
+        // Stall probabilístico por OpType, determinista por evento.
+        // Mismas probabilidades y latencias que FGMT/CGMT.
+        // Secuencial: no hay hiding, se paga el stall completo.
+        double miss_prob    = (op == DOT_PRODUCT) ? 2.4 : 0.6;  // %
+        long long stall_lat = (op == DOT_PRODUCT) ? 8LL  : 3LL; // ciclos
+        static constexpr uint32_t SEED = 42u;
+        uint32_t pct = random_det(SEED, tag, j, k, op) % 100u;
+        if (pct < static_cast<uint32_t>(miss_prob)) {
+            stall_count++;
+            global_clock += stall_lat;
+        }
+
+        return a * b;
+    }
+
+    // Multiplicaciones en ciclos clasificadas como light/heavy.
+    template <typename T>
+    inline T mul_light(T a, T b, OpType op, uint32_t tag, int j, int k) {
+        return mul_impl(a, b, false, op, tag, j, k);
+    }
+
+    template <typename T>
+    inline T mul_heavy(T a, T b, OpType op, uint32_t tag, int j, int k) {
+        return mul_impl(a, b, true, op, tag, j, k);
+    }
+
+    // Multiplicación fuera de ciclos (no consume ciclos, solo se contabiliza como total).
+    template <typename T>
+    inline T mul_total(T a, T b) {
+        total_multiplications++;
+        return a * b;
+    }
     
 public:
     NeuralNetwork() {
@@ -80,13 +118,21 @@ public:
         }
     }
 
-    //FORWARD PROPAGATION ---------------------------------------
+    // Getters de métricas (útiles para imprimir/CSV desde main)
+    long long get_cycle_mul_count() const { return cycle_mul_count; }
+    long long get_cycle_mul_light_count() const { return cycle_mul_light_count; }
+    long long get_cycle_mul_heavy_count() const { return cycle_mul_heavy_count; }
+    long long get_total_multiplications() const { return total_multiplications; }
+    long long get_stall_count() const { return stall_count; }
+    long long get_global_clock() const { return global_clock; }
+
+    //FORWARDPROPAGATION ---------------------------------------
     double forward(double input[]) {
         // Capa oculta
         for (int j = 0; j < HIDDEN_NEURONS; j++) {
             hidden_input[j] = bh[j];
             for (int i = 0; i < INPUT_DIM; i++) {
-                hidden_input[j] += input[i] * wh[i][j];
+                hidden_input[j] += mul_light(input[i], wh[i][j], DOT_PRODUCT, 10u, j, i);
             }
             hidden_output[j] = tanh_activation(hidden_input[j]);
         }
@@ -95,7 +141,7 @@ public:
         for (int j = 0; j < OUTPUT_DIM; j++) {
             output_input[j] = bo[j];
             for (int i = 0; i < HIDDEN_NEURONS; i++) {
-                output_input[j] += hidden_output[i] * wo[i][j];
+                output_input[j] += mul_light(hidden_output[i], wo[i][j], DOT_PRODUCT, 20u, i, j);
             }
             output[j] = output_input[j];
         }
@@ -123,33 +169,40 @@ public:
         for (int j = 0; j < HIDDEN_NEURONS; j++) {
             hidden_error[j] = 0.0;
             for (int k = 0; k < OUTPUT_DIM; k++) {
-                hidden_error[j] += output_delta[k] * wo[j][k];
+                hidden_error[j] += mul_heavy(output_delta[k], wo[j][k], DOT_PRODUCT, 30u, j, k);
             }
-            hidden_delta[j] = hidden_error[j] * tanh_derivative(hidden_input[j]);
+
+            // ACTIVATION: alinear con FGMT/CGMT (tt = t*t; 1-tt)
+            double t = tanh_activation(hidden_input[j]);
+            double tt = mul_heavy(t, t, ACTIVATION, 31u, j, 0);
+            hidden_delta[j] = mul_heavy(hidden_error[j], (1.0 - tt), ACTIVATION, 32u, j, 0);
         }
         
         //recalculo pesos hidden - output
         for (int i = 0; i < HIDDEN_NEURONS; i++) {
             for (int j = 0; j < OUTPUT_DIM; j++) {
-                wo[i][j] -= learning_rate * output_delta[j] * hidden_output[i];
+                // grad (heavy)
+                double grad = mul_heavy(output_delta[j], hidden_output[i], DOT_PRODUCT, 40u, i, j);
+                wo[i][j] -= mul_total(learning_rate, grad);
             }
         }
         
         //recalculo bias output
         for (int j = 0; j < OUTPUT_DIM; j++) {
-            bo[j] -= learning_rate * output_delta[j];
+            bo[j] -= mul_total(learning_rate, output_delta[j]);
         }
         
         //recalculo pesos input - hidden
         for (int i = 0; i < INPUT_DIM; i++) {
             for (int j = 0; j < HIDDEN_NEURONS; j++) {
-                wh[i][j] -= learning_rate * hidden_delta[j] * input[i];
+                double grad = mul_heavy(hidden_delta[j], input[i], DOT_PRODUCT, 50u, j, i);
+                wh[i][j] -= mul_total(learning_rate, grad);
             }
         }
         
         //recalculo bias hidden
         for (int j = 0; j < HIDDEN_NEURONS; j++) {
-            bh[j] -= learning_rate * hidden_delta[j];
+            bh[j] -= mul_total(learning_rate, hidden_delta[j]);
         }
     }
     
@@ -171,7 +224,7 @@ public:
                 
                 // Calcular pérdida (MSE)
                 double error = prediction - Y[i];
-                total_loss += error * error;
+                total_loss += mul_total(error, error);
                 
                 // Backward pass
                 backward(input, Y[i], learning_rate);
@@ -212,24 +265,3 @@ public:
     
 
 };
-
-//se cargan los datos del archivo txt
-void loadDataset(const string& filename, vector<vector<double>>& X, vector<double>& Y) {
-    ifstream file(filename);
-    
-    if (!file.is_open()) {
-        cerr << "Error: No se pudo abrir el archivo de datos" << endl;
-        return;
-    }
-    
-    double x1, x2, x3, y;
-    while (file >> x1 >> x2 >> x3 >> y) {
-        vector<double> input = {x1, x2, x3};
-        X.push_back(input);
-        Y.push_back(y);
-    }
-    
-    file.close();
-    cout << "Dataset cargado: " << X.size() << " muestras" << endl;
-}
-

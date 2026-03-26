@@ -1,21 +1,8 @@
-// Algoritmo multithread (asignación dinámica de neuronas).
-// Similar a `algorythm.cpp`, pero paraleliza por neuronas usando una cola/índice atómico.
-//
-// Idea:
-// - En forward:
-//   * Cada neurona oculta j se puede calcular en paralelo.
-//   * Luego, cada neurona de salida (aquí OUTPUT_DIM=1) reduce sobre hidden_output.
-// - En backward:
-//   * hidden_delta[j] se puede calcular en paralelo.
-//   * Update de wo[i][0] (por i) y wh[*][j] (por j) también se puede paralelizar.
-//
-// Importante:
-// - Este archivo NO simula ciclos/scheduler como FGMT/CGMT.
-// - Solo busca paralelizar el cómputo manteniendo la matemática del algoritmo base.
-
+/* Algoritmo de entrenamiento de una red neuronal utilizando multithreading
+- Cada neurona se entrena en un hilo separado.
+- Se utiliza una cola de tareas para gestionar la asignación de neuronas a hilos
+*/
 #include <iostream>
-#include <fstream>
-#include <cmath>
 #include <cstdlib>
 #include <ctime>
 #include <vector>
@@ -23,31 +10,10 @@
 #include <atomic>
 #include <algorithm>
 
+#include "../common/nn_utils.h"
+#include "../common/dataset.h"
+
 using namespace std;
-
-// Constantes de la red neuronal
-const int INPUT_DIM = 3;
-const int HIDDEN_NEURONS = 30;
-const int OUTPUT_DIM = 1;
-const double LEARNING_RATE = 0.08;
-const int EPOCHS = 1500;
-
-static inline double basefunction(double x[], int d) {
-    double sum = 0;
-    for (int i = 0; i < d; i++) {
-        sum += sin(x[i]) + 0.3 * x[i] * x[i];
-    }
-    return sum;
-}
-
-static inline double tanh_activation(double x) {
-    return tanh(x);
-}
-
-static inline double tanh_derivative(double x) {
-    double t = tanh(x);
-    return 1.0 - t * t;
-}
 
 class NeuralNetworkThreaded {
 private:
@@ -209,21 +175,3 @@ public:
 
     int get_num_threads() const { return num_threads; }
 };
-
-void loadDataset(const string& filename, vector<vector<double>>& X, vector<double>& Y) {
-    ifstream file(filename);
-
-    if (!file.is_open()) {
-        cerr << "Error: No se pudo abrir el archivo de datos" << endl;
-        return;
-    }
-
-    double x1, x2, x3, y;
-    while (file >> x1 >> x2 >> x3 >> y) {
-        X.push_back({x1, x2, x3});
-        Y.push_back(y);
-    }
-
-    file.close();
-    cout << "Dataset cargado: " << X.size() << " muestras" << endl;
-}
