@@ -20,7 +20,6 @@ inline bool loadDataset(const std::string& filename,
         Y.push_back(y);
     }
 
-    std::cout << "Dataset cargado: " << X.size() << " muestras" << std::endl;
     return true;
 }
 

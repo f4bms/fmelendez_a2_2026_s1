@@ -59,10 +59,13 @@ private:
 	long long global_clock;
 
 	// Estado
+	uint32_t stall_seed;
+
 	int current_active_thread;
 	bool phase_open;
 	int phase_done_count;
 	vector<bool> thread_done;
+	vector<long long> thread_resume_clock; // ciclo mínimo en que cada hilo puede reanudar tras un stall
 
 	// Nota: antes había asignación dinámica por cola (next_index / take_next).
 	// En esta versión el reparto de trabajo es estático por hilo (strided) en la NN,
@@ -120,14 +123,16 @@ public:
 	CoarseGrainedScheduler(int num_threads_arg,
 						   long long stall_latency_cycles_arg = 1,
 						   long long context_switch_penalty_cycles_arg = 1,
-						   unsigned int /*fixed_seed*/ = 42u)
+						   uint32_t stall_seed_arg = 42u)
 		: num_threads(num_threads_arg), stall_latency_cycles(stall_latency_cycles_arg),
 		  context_switch_penalty_cycles(context_switch_penalty_cycles_arg),
+		  stall_seed(stall_seed_arg),
 		  cycle_mul_light_count(0), cycle_mul_heavy_count(0), uncounted_mul_count(0),
 		  compute_multiplications(0), total_multiplications(0),
 		  stall_count(0), stall_events_on_heavy_count(0), context_switch_count(0), fetch_count(0), nop_count(0),
 		  global_clock(0), current_active_thread(0), phase_open(false),
-		  phase_done_count(0), thread_done(num_threads_arg, false) {
+		  phase_done_count(0), thread_done(num_threads_arg, false),
+		  thread_resume_clock(num_threads_arg, 0LL) {
 	}
 
 	void begin_phase() {
@@ -136,6 +141,7 @@ public:
 		phase_done_count = 0;
 		current_active_thread = 0;
 		fill(thread_done.begin(), thread_done.end(), false);
+		fill(thread_resume_clock.begin(), thread_resume_clock.end(), 0LL);
 		cv.notify_all();
 	}
 
@@ -176,6 +182,11 @@ public:
 	void wait_active(int thread_id) {
 		unique_lock<mutex> lock(m);
 		cv.wait(lock, [&] { return !phase_open || current_active_thread == thread_id; });
+		// Si el stall de este hilo no fue completamente cubierto por el trabajo del otro hilo,
+		// se pagan los ciclos restantes ahora que retoma el control.
+		if (phase_open && global_clock < thread_resume_clock[thread_id]) {
+			global_clock = thread_resume_clock[thread_id];
+		}
 	}
 
 	// 1) Multiplicación normal: NO se contabiliza y NO consume ciclos del scheduler.
@@ -217,25 +228,28 @@ public:
 		}
 
 			// CGMT NO cambia de hilo salvo que ocurra stall.
-			// Mismas probabilidades y latencias que FGMT, pero sin hiding (se paga completo).
-			double miss_prob    = (op == DOT_PRODUCT) ? 2.4 : 0.6;  // %
-			long long stall_lat = (op == DOT_PRODUCT) ? 8LL  : 3LL; // ciclos del stall
-			static constexpr uint32_t SEED = 42u;
-			uint32_t pct = random(SEED, tag, j, k, op) % 100u;
-			if (pct < static_cast<uint32_t>(miss_prob)) {
+			// Con hiding: el otro hilo cubre los ciclos del stall mientras este espera.
+			// La penalidad real es solo el context switch; el stall queda oculto si el
+			// otro hilo hace suficiente trabajo antes de devolver el turno.
+			uint32_t miss_pct1000 = (op == DOT_PRODUCT) ? 24u : 6u; // 2.4% → 24/1000, 0.6% → 6/1000
+			long long stall_lat   = (op == DOT_PRODUCT) ? 8LL : 3LL; // ciclos del stall
+			uint32_t pct = random(stall_seed, tag, j, k, op) % 1000u;
+			if (pct < miss_pct1000) {
 				stall_count++;
 				if (is_heavy) stall_events_on_heavy_count++;
 
 				int old = current_active_thread;
 				if (unfinished_threads_locked() > 1) {
-					// Hay otro hilo disponible: paga stall_lat + context_switch_penalty.
+					// Registrar cuándo puede reanudar este hilo (su stall termina en este ciclo).
+					thread_resume_clock[thread_id] = global_clock + stall_lat;
+					// Solo se paga el overhead del context switch; el stall lo oculta el otro hilo.
 					switch_to_next_thread_locked();
 					if (current_active_thread != old) {
 						context_switch_count++;
-						global_clock += stall_lat + context_switch_penalty_cycles;
+						global_clock += pick_latency(is_heavy, op);
 					}
 				} else {
-					// Solo 1 hilo activo: solo paga el stall completo (sin switch).
+					// Solo 1 hilo activo: no hay hiding, se paga el stall completo.
 					global_clock += stall_lat;
 				}
 				cv.notify_all();

@@ -37,12 +37,15 @@ private:
     long long total_multiplications;
     long long global_clock;
     int current_turn;
+    vector<long long> thread_resume_clock; // ciclo mínimo de reanudación por hilo tras un stall
 
     
     static const long long LATENCY_LIGHT_DOT    = 1;   // forward: w*x  (pipelined, liviano)
     static const long long LATENCY_LIGHT_ACT    = 1;   // (reservado para activaciones ligeras futuras)
     static const long long LATENCY_HEAVY_DOT    = 3;   // backward: w*delta  (gradiente, pesado)
     static const long long LATENCY_HEAVY_ACT    = 2;   // backward: t*t, error*deriv  (derivada de tanh, más costoso)
+
+    uint32_t stall_seed;
 
     mutex m;
     condition_variable cv;
@@ -65,21 +68,25 @@ private:
     }
 
 public:
-    RoundRobinScheduler(int num_threads_arg, long long context_switch_penalty_cycles_arg = 1)
+    RoundRobinScheduler(int num_threads_arg, long long context_switch_penalty_cycles_arg = 1,
+                        uint32_t stall_seed_arg = 42u)
     : num_threads(num_threads_arg),
     context_switch_penalty_cycles(context_switch_penalty_cycles_arg),
+    stall_seed(stall_seed_arg),
     light_count(0), heavy_count(0),
     light_dot_count(0), light_act_count(0),
     heavy_dot_count(0), heavy_act_count(0),
     fetch_count(0), stall_nop_count(0),
     context_switch_count(0),
     total_multiplications(0), global_clock(0), current_turn(0),
-    phase_open(false) {}
+    phase_open(false),
+    thread_resume_clock(num_threads_arg, 0LL) {}
 
     void begin_phase() {
         unique_lock<mutex> lock(m);
         phase_open = true;
         current_turn = 0;
+        fill(thread_resume_clock.begin(), thread_resume_clock.end(), 0LL);
         cv.notify_all();
     }
 
@@ -98,6 +105,10 @@ public:
     bool wait_turn(int thread_id) {
         unique_lock<mutex> lock(m);
         cv.wait(lock, [&] { return !phase_open || current_turn == thread_id; });
+        // Si el trabajo de los otros hilos no alcanzó a cubrir el stall, pagar lo que faltó
+        if (phase_open && global_clock < thread_resume_clock[thread_id]) {
+            global_clock = thread_resume_clock[thread_id];
+        }
         return phase_open;
     }
 
@@ -114,9 +125,26 @@ public:
     // avanza el turno
     void advance_turn() {
         unique_lock<mutex> lock(m);
-        const int prev_turn = current_turn;
         current_turn = (current_turn + 1) % num_threads;
         cv.notify_all();
+    }
+
+    // avanza el turno y registra el stall atómicamente bajo el mismo lock,
+    // eliminando la race condition entre advance_turn() y check_stall().
+    // Retorna false si la fase se cerró.
+    bool advance_and_check_stall(int thread_id, OpType op, uint32_t tag, int j, int k) {
+        unique_lock<mutex> lock(m);
+        current_turn = (current_turn + 1) % num_threads;
+        cv.notify_all();
+        if (!phase_open) return false;
+        uint32_t miss_pct1000 = (op == DOT_PRODUCT) ? 24u : 6u;
+        long long stall_lat   = (op == DOT_PRODUCT) ? 8LL : 3LL;
+        uint32_t pct = random(stall_seed, tag, j, k, op) % 1000u;
+        if (pct < miss_pct1000) {
+            stall_nop_count++;
+            thread_resume_clock[thread_id] = global_clock + stall_lat;
+        }
+        return true;
     }
 
 private:
@@ -136,8 +164,6 @@ private:
     }
 
 public:
-    // En esta versión (estática) no hay "fetch" dinámico.
-    // Dejamos el contador en 0 para comparabilidad de métricas.
 
     void count_light() { lock_guard<mutex> l(m); light_count++; }
     void count_heavy() { lock_guard<mutex> l(m); heavy_count++; }
@@ -148,61 +174,28 @@ public:
     T mul_light(T a, T b, OpType op) {
         lock_guard<mutex> lock(m);
         light_count++;
-    if (op == DOT_PRODUCT) light_dot_count++;
-    else                  light_act_count++;
+        if (op == DOT_PRODUCT) light_dot_count++;
+        else                   light_act_count++;
         global_clock++;
-        T r = a * b;
-        const int prev_turn = current_turn;
-        current_turn = (current_turn + 1) % num_threads;
-        if (num_threads > 1 && current_turn != prev_turn) {
-            apply_context_switch_latency_locked();
+        if (num_threads > 1) {
+            context_switch_count++;
+            global_clock += pick_latency(false, op);
         }
-        cv.notify_all();
-        return r;
+        return a * b;
     }
 
     template <typename T>
     T mul_heavy(T a, T b, OpType op) {
         lock_guard<mutex> lock(m);
         heavy_count++;
-    if (op == DOT_PRODUCT) heavy_dot_count++;
-    else                  heavy_act_count++;
+        if (op == DOT_PRODUCT) heavy_dot_count++;
+        else                   heavy_act_count++;
         global_clock++;
-        T r = a * b;
-        const int prev_turn = current_turn;
-        current_turn = (current_turn + 1) % num_threads;
-        if (num_threads > 1 && current_turn != prev_turn) {
-            apply_context_switch_latency_locked();
+        if (num_threads > 1) {
+            context_switch_count++;
+            global_clock += pick_latency(true, op);
         }
-        cv.notify_all();
-        return r;
-    }
-
-    // Simula stalls (misses) de memoria dependiendo del tipo de operación.
-    // Retorna false si la fase se cerró mientras el hilo esperaba su turno.
-    // tag/j/k identifican de forma determinista el "evento" (multiplicación lógica)
-    // para que el patrón de stalls sea reproducible y no dependa del scheduling.
-    bool check_stall(int thread_id, OpType op, uint32_t tag, int j, int k) {
-        // DOT_PRODUCT: alta presión de memoria → mayor probabilidad y stall más largo.
-        // ACTIVATION: compute-bound → menor probabilidad y stall corto.
-        double miss_prob    = (op == DOT_PRODUCT) ? 2.4 : 0.6;  // %
-        long long stall_lat = (op == DOT_PRODUCT) ? 8LL  : 3LL; // ciclos del stall
-
-        static constexpr uint32_t SEED = 42u;
-        (void)thread_id;
-        uint32_t pct = random(SEED, tag, j, k, op) % 100u;
-
-        if (pct < static_cast<uint32_t>(miss_prob)) {
-            lock_guard<mutex> l(m);
-            if (!phase_open) return false;
-            stall_nop_count++;
-            // FGMT: el pipeline siempre tiene num_threads slots. Un hilo terminado
-            // ocupa su slot con NOPs, así que la capacidad de absorción es siempre num_threads-1.
-            long long absorbed = std::min(stall_lat, (long long)(num_threads - 1));
-            global_clock += std::max(0LL, stall_lat - absorbed);
-        }
-
-        return true;
+        return a * b;
     }
 
     // Multiplicación fuera de ciclos (lr * grad, error^2, etc.).
@@ -263,22 +256,19 @@ private:
     //se usa un generador de numeros aleatorios
     std::mt19937 rng;
 
-    double uniform_symmetric(double scale) {
-        std::uniform_real_distribution<double> dist(-scale, scale);
-        return dist(rng);
+    double uniform_01() {
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    return dist(rng);
     }
     
 public:
-    NeuralNetworkFineGrained(RoundRobinScheduler* sched) : scheduler(sched) {
-    // Semilla fija para reproducibilidad entre ejecuciones.
-    // Si querés variabilidad controlada, podés convertirlo en parámetro desde main.
-    static constexpr uint32_t NN_SEED = 12345u;
-    rng.seed(NN_SEED);
+    NeuralNetworkFineGrained(RoundRobinScheduler* sched, uint32_t nn_seed = 42u) : scheduler(sched) {
+    rng.seed(nn_seed);
         
         // base inicial de pesos de input a hidden
         for (int i = 0; i < INPUT_DIM; i++) {
             for (int j = 0; j < HIDDEN_NEURONS; j++) {
-                wh[i][j] = uniform_symmetric(0.5) * sqrt(2.0 / INPUT_DIM);
+                wh[i][j] = (uniform_01() - 0.5) * sqrt(2.0 / INPUT_DIM);
             }
         }
 
@@ -290,7 +280,7 @@ public:
         // base inicial de pesos de hidden a output
         for (int i = 0; i < HIDDEN_NEURONS; i++) {
             for (int j = 0; j < OUTPUT_DIM; j++) {
-                wo[i][j] = uniform_symmetric(0.5) * sqrt(2.0 / HIDDEN_NEURONS);
+                wo[i][j] = (uniform_01() - 0.5) * sqrt(2.0 / HIDDEN_NEURONS);
             }
         }
 
@@ -315,8 +305,7 @@ public:
                 for (int k = 0; k < INPUT_DIM; k++) {
                     if (!scheduler->wait_turn(thread_id)) return;
                     hidden_input[j] += scheduler->mul_light(input[k], wh[k][j], DOT_PRODUCT);
-                    scheduler->advance_turn();
-                    if (!scheduler->check_stall(thread_id, DOT_PRODUCT, /*tag*/ 10u, /*j*/ j, /*k*/ k)) return;
+                    if (!scheduler->advance_and_check_stall(thread_id, DOT_PRODUCT, /*tag*/ 10u, /*j*/ j, /*k*/ k)) return;
                 }
                 hidden_output[j] = tanh_activation(hidden_input[j]);
             }
@@ -345,8 +334,7 @@ public:
                 for (int outj = 0; outj < OUTPUT_DIM; outj++) {
                     if (!scheduler->wait_turn(thread_id)) return;
                     output_input[outj] += scheduler->mul_light(hidden_output[i], wo[i][outj], DOT_PRODUCT);
-                    scheduler->advance_turn();
-                    if (!scheduler->check_stall(thread_id, DOT_PRODUCT, /*tag*/ 20u, /*j*/ i, /*k*/ outj)) return;
+                    if (!scheduler->advance_and_check_stall(thread_id, DOT_PRODUCT, /*tag*/ 20u, /*j*/ i, /*k*/ outj)) return;
                 }
             }
             if (output_finished.fetch_add(1) + 1 == num_threads) {
@@ -392,21 +380,18 @@ public:
                 for (int k = 0; k < OUTPUT_DIM; k++) {
                     if (!scheduler->wait_turn(thread_id)) return;
                     hidden_error[j] += scheduler->mul_heavy(output_delta[k], wo[j][k], DOT_PRODUCT);
-                    scheduler->advance_turn();
-                    if (!scheduler->check_stall(thread_id, DOT_PRODUCT, /*tag*/ 30u, /*j*/ j, /*k*/ k)) return;
+                    if (!scheduler->advance_and_check_stall(thread_id, DOT_PRODUCT, /*tag*/ 30u, /*j*/ j, /*k*/ k)) return;
                 }
 
                 // Derivada tanh: (1 - t^2)
                 if (!scheduler->wait_turn(thread_id)) return;
                 double t = tanh(hidden_input[j]);
                 double tt = scheduler->mul_heavy(t, t, ACTIVATION);
-                scheduler->advance_turn();
-                if (!scheduler->check_stall(thread_id, ACTIVATION, /*tag*/ 31u, /*j*/ j, /*k*/ 0)) return;
+                if (!scheduler->advance_and_check_stall(thread_id, ACTIVATION, /*tag*/ 31u, /*j*/ j, /*k*/ 0)) return;
 
                 if (!scheduler->wait_turn(thread_id)) return;
                 hidden_delta[j] = scheduler->mul_heavy(hidden_error[j], (1.0 - tt), ACTIVATION);
-                scheduler->advance_turn();
-                if (!scheduler->check_stall(thread_id, ACTIVATION, /*tag*/ 32u, /*j*/ j, /*k*/ 0)) return;
+                if (!scheduler->advance_and_check_stall(thread_id, ACTIVATION, /*tag*/ 32u, /*j*/ j, /*k*/ 0)) return;
             }
             if (bhe_finished.fetch_add(1) + 1 == num_threads) {
                 scheduler->end_phase();
@@ -427,8 +412,7 @@ public:
                     if (!scheduler->wait_turn(thread_id)) return;
                     double grad = scheduler->mul_heavy(output_delta[outj], hidden_output[i], DOT_PRODUCT);
                     wo[i][outj] -= scheduler->mul_total(learning_rate, grad);
-                    scheduler->advance_turn();
-                    if (!scheduler->check_stall(thread_id, DOT_PRODUCT, /*tag*/ 40u, /*j*/ i, /*k*/ outj)) return;
+                    if (!scheduler->advance_and_check_stall(thread_id, DOT_PRODUCT, /*tag*/ 40u, /*j*/ i, /*k*/ outj)) return;
                 }
             }
             if (uwo_finished.fetch_add(1) + 1 == num_threads) {
@@ -454,8 +438,7 @@ public:
                     if (!scheduler->wait_turn(thread_id)) return;
                     double grad = scheduler->mul_heavy(hidden_delta[j], input[k], DOT_PRODUCT);
                     wh[k][j] -= scheduler->mul_total(learning_rate, grad);
-                    scheduler->advance_turn();
-                    if (!scheduler->check_stall(thread_id, DOT_PRODUCT, /*tag*/ 50u, /*j*/ j, /*k*/ k)) return;
+                    if (!scheduler->advance_and_check_stall(thread_id, DOT_PRODUCT, /*tag*/ 50u, /*j*/ j, /*k*/ k)) return;
                 }
             }
             if (uwh_finished.fetch_add(1) + 1 == num_threads) {

@@ -7,7 +7,7 @@ constexpr int INPUT_DIM = 3;
 constexpr int HIDDEN_NEURONS = 30;
 constexpr int OUTPUT_DIM = 1;
 constexpr double LEARNING_RATE = 0.08;
-constexpr int EPOCHS = 1;
+constexpr int EPOCHS = 500;
 
 // --- Tipo de operación para clasificar latencia en el scheduler ---
 // DOT_PRODUCT : multiplicaciones de pesos/gradientes (w*x, w*delta, ...)

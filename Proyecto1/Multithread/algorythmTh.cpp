@@ -1,14 +1,16 @@
 /* Algoritmo de entrenamiento de una red neuronal utilizando multithreading
-- Cada neurona se entrena en un hilo separado.
-- Se utiliza una cola de tareas para gestionar la asignación de neuronas a hilos
+- Scheduling estático strided: cada hilo procesa neuronas j = tid, tid+T, tid+2T, ...
+- Sin cola de tareas, igual que FGMT y CGMT.
+- Inicialización de pesos determinista (mt19937 con seed fija).
 */
 #include <iostream>
 #include <cstdlib>
-#include <ctime>
 #include <vector>
 #include <thread>
-#include <atomic>
+#include <random>
 #include <algorithm>
+#include <pthread.h>
+#include <sched.h>
 
 #include "../common/nn_utils.h"
 #include "../common/dataset.h"
@@ -28,33 +30,39 @@ private:
     double output[OUTPUT_DIM];
 
     int num_threads;
+    vector<int> cpu_ids;
 
+    // Helper: lanza hilos con scheduling estático strided y espera a que terminen.
     template <typename Fn>
-    void parallel_for_dynamic(int total_items, Fn fn) {
-        atomic<int> next{0};
+    void parallel_strided(int total_items, Fn fn) {
         vector<thread> threads;
         threads.reserve(num_threads);
-
         for (int t = 0; t < num_threads; t++) {
             threads.emplace_back([&, t] {
-                while (true) {
-                    int idx = next.fetch_add(1, memory_order_relaxed);
-                    if (idx >= total_items) break;
+                if (!cpu_ids.empty()) {
+                    cpu_set_t cpuset;
+                    CPU_ZERO(&cpuset);
+                    CPU_SET(cpu_ids[t % (int)cpu_ids.size()], &cpuset);
+                    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+                }
+                for (int idx = t; idx < total_items; idx += num_threads) {
                     fn(idx, t);
                 }
             });
         }
-        for (auto &th : threads) th.join();
+        for (auto& th : threads) th.join();
     }
 
 public:
-    explicit NeuralNetworkThreaded(int n_threads)
-        : num_threads(max(1, n_threads)) {
-        srand(time(NULL));
+    explicit NeuralNetworkThreaded(int n_threads, vector<int> cores = {}, unsigned int fixed_seed = 42u)
+        : num_threads(max(1, n_threads)), cpu_ids(move(cores)) {
+        // RNG determinista, igual que CGMT/FGMT
+        std::mt19937 rng(fixed_seed);
+        std::uniform_real_distribution<double> uni(0.0, 1.0);
 
         for (int i = 0; i < INPUT_DIM; i++) {
             for (int j = 0; j < HIDDEN_NEURONS; j++) {
-                wh[i][j] = ((double)rand() / RAND_MAX - 0.5) * sqrt(2.0 / INPUT_DIM);
+                wh[i][j] = (uni(rng) - 0.5) * sqrt(2.0 / INPUT_DIM);
             }
         }
 
@@ -62,7 +70,7 @@ public:
 
         for (int i = 0; i < HIDDEN_NEURONS; i++) {
             for (int j = 0; j < OUTPUT_DIM; j++) {
-                wo[i][j] = ((double)rand() / RAND_MAX - 0.5) * sqrt(2.0 / HIDDEN_NEURONS);
+                wo[i][j] = (uni(rng) - 0.5) * sqrt(2.0 / HIDDEN_NEURONS);
             }
         }
 
@@ -70,8 +78,8 @@ public:
     }
 
     double forward(const double input[]) {
-        // Capa oculta: cada neurona j es independiente.
-        parallel_for_dynamic(HIDDEN_NEURONS, [&](int j, int /*tid*/) {
+        // Capa oculta: cada neurona j es independiente → strided por hilo.
+        parallel_strided(HIDDEN_NEURONS, [&](int j, int /*tid*/) {
             double sum = bh[j];
             for (int i = 0; i < INPUT_DIM; i++) {
                 sum += input[i] * wh[i][j];
@@ -80,7 +88,7 @@ public:
             hidden_output[j] = tanh_activation(sum);
         });
 
-        // Capa de salida: OUTPUT_DIM=1. Reducimos en un solo hilo (simple y seguro).
+        // Capa de salida: OUTPUT_DIM=1, secuencial (sin races).
         for (int outj = 0; outj < OUTPUT_DIM; outj++) {
             double sum = bo[outj];
             for (int i = 0; i < HIDDEN_NEURONS; i++) {
@@ -99,37 +107,38 @@ public:
             output_delta[j] = output[j] - target;
         }
 
-        // hidden_delta[j] independiente por neurona.
+        // hidden_delta[j]: independiente por neurona → strided.
         double hidden_delta[HIDDEN_NEURONS];
-        parallel_for_dynamic(HIDDEN_NEURONS, [&](int j, int /*tid*/) {
+        parallel_strided(HIDDEN_NEURONS, [&](int j, int /*tid*/) {
             double hidden_error = 0.0;
             for (int k = 0; k < OUTPUT_DIM; k++) {
                 hidden_error += output_delta[k] * wo[j][k];
             }
-            hidden_delta[j] = hidden_error * tanh_derivative(hidden_input[j]);
+            double t = tanh_activation(hidden_input[j]);
+            hidden_delta[j] = hidden_error * (1.0 - t * t);
         });
 
-        // Actualizar wo por i (independiente por fila i porque OUTPUT_DIM=1).
-        parallel_for_dynamic(HIDDEN_NEURONS, [&](int i, int /*tid*/) {
+        // Actualizar wo: independiente por fila i (OUTPUT_DIM=1).
+        parallel_strided(HIDDEN_NEURONS, [&](int i, int /*tid*/) {
             for (int j = 0; j < OUTPUT_DIM; j++) {
                 wo[i][j] -= learning_rate * output_delta[j] * hidden_output[i];
             }
         });
 
-        // Bias output (OUTPUT_DIM=1): secuencial.
+        // Bias output: secuencial.
         for (int j = 0; j < OUTPUT_DIM; j++) {
             bo[j] -= learning_rate * output_delta[j];
         }
 
-        // Actualizar wh por neurona oculta j (cada j actualiza wh[*][j]).
-        parallel_for_dynamic(HIDDEN_NEURONS, [&](int j, int /*tid*/) {
+        // Actualizar wh: cada hilo actualiza columnas wh[*][j] → strided por j.
+        parallel_strided(HIDDEN_NEURONS, [&](int j, int /*tid*/) {
             for (int i = 0; i < INPUT_DIM; i++) {
                 wh[i][j] -= learning_rate * hidden_delta[j] * input[i];
             }
         });
 
-        // Bias hidden: paralelo por neurona j.
-        parallel_for_dynamic(HIDDEN_NEURONS, [&](int j, int /*tid*/) {
+        // Bias hidden: strided por j.
+        parallel_strided(HIDDEN_NEURONS, [&](int j, int /*tid*/) {
             bh[j] -= learning_rate * hidden_delta[j];
         });
     }
@@ -150,7 +159,7 @@ public:
                 backward(in, Y[i], learning_rate);
             }
 
-            if ((epoch + 1) % 100 == 0) {
+            if ((epoch + 1) % 500 == 0) {
                 double mse = total_loss / n_samples;
                 cout << "Epoch " << (epoch + 1) << "/" << epochs << " - MSE: " << mse << endl;
             }
@@ -165,7 +174,6 @@ public:
         for (int i = 0; i < n_samples; i++) {
             double in[INPUT_DIM];
             for (int j = 0; j < INPUT_DIM; j++) in[j] = X[i][j];
-
             double prediction = forward(in);
             double error = prediction - Y[i];
             total_loss += error * error;

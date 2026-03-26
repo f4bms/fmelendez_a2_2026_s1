@@ -3,6 +3,10 @@ CXXFLAGS := -O2 -std=c++17 -pthread
 
 THREADS ?= 2
 RUNS ?= 1
+SEED ?= 42
+
+# SMT perf — pasar SMT_CORES al invocar, ej: make perf_smt_all SMT_CORES=0,4
+PERF_EVENTS := task-clock,cpu_core/cycles/,cpu_core/instructions/,cpu_core/cache-misses/
 
 ROOT := .
 RESULTS_DIR := $(ROOT)/results
@@ -36,7 +40,7 @@ metrics: metrics_fgmt metrics_cgmt metrics_normal
 metrics_fgmt: build results_dir
 	@mkdir -p $(RESULTS_DIR)
 	@touch $(RESULTS_DIR)/metrics.csv
-	@cd $(abspath $(FGMT_DIR)) && rm -f metrics.csv && ./main_fgmt $(THREADS)
+	@cd $(abspath $(FGMT_DIR)) && rm -f metrics.csv && ./main_fgmt $(THREADS) $(SEED)
 	@{ \
 		if [ ! -s "$(RESULTS_DIR)/metrics.csv" ]; then \
 			cat "$(FGMT_DIR)/metrics.csv"; \
@@ -49,7 +53,7 @@ metrics_fgmt: build results_dir
 metrics_cgmt: cgmt_build results_dir
 	@mkdir -p $(RESULTS_DIR)
 	@touch $(RESULTS_DIR)/metrics.csv
-	@cd $(abspath $(CGMT_DIR)) && rm -f metrics.csv && ./main_cgmt $(THREADS)
+	@cd $(abspath $(CGMT_DIR)) && rm -f metrics.csv && ./main_cgmt $(THREADS) $(SEED)
 	@{ \
 		if [ ! -s "$(RESULTS_DIR)/metrics.csv" ]; then \
 			cat "$(CGMT_DIR)/metrics.csv"; \
@@ -62,7 +66,7 @@ metrics_cgmt: cgmt_build results_dir
 metrics_normal: normal_build results_dir
 	@mkdir -p $(RESULTS_DIR)
 	@touch $(RESULTS_DIR)/metrics.csv
-	@cd $(abspath $(NORMAL_DIR)) && rm -f metrics.csv && ./main_normal
+	@cd $(abspath $(NORMAL_DIR)) && rm -f metrics.csv && ./main_normal $(SEED)
 	@{ \
 		if [ ! -s "$(RESULTS_DIR)/metrics.csv" ]; then \
 			cat "$(NORMAL_DIR)/metrics.csv"; \
@@ -81,9 +85,9 @@ metrics_all: build cgmt_build normal_build results_dir
 .PHONY: metrics_runs
 metrics_runs: build cgmt_build normal_build results_dir
 	@for i in $$(seq 1 $(RUNS)); do \
-		$(MAKE) THREADS=$(THREADS) metrics_fgmt; \
-		$(MAKE) THREADS=$(THREADS) metrics_cgmt; \
-		$(MAKE) metrics_normal; \
+		$(MAKE) THREADS=$(THREADS) SEED=$$i metrics_fgmt; \
+		$(MAKE) THREADS=$(THREADS) SEED=$$i metrics_cgmt; \
+		$(MAKE) SEED=$$i metrics_normal; \
 	done
 
 $(FGMT_BIN): $(FGMT_DIR)/mainFGMT.cpp $(FGMT_DIR)/algorythmFGMT.cpp $(ROOT)/common/runner.h $(ROOT)/common/nn_utils.h $(ROOT)/common/dataset.h
@@ -113,6 +117,36 @@ cgmt_run50: cgmt_build results_dir
 		cd $(abspath $(CGMT_DIR)) && ./main_cgmt >> "$(abspath $(RESULTS_DIR))/cgmt_$$i.txt"; \
 		echo >> $(RESULTS_DIR)/cgmt_$$i.txt; \
 	done
+
+# ── SMT perf targets ──────────────────────────────────────────────────────────
+MT_DIR := $(ROOT)/Multithread
+MT_BIN  := $(MT_DIR)/main_th
+
+.PHONY: mt_build perf_smt
+
+mt_build: $(MT_BIN)
+
+$(MT_BIN): $(MT_DIR)/mainTh.cpp $(MT_DIR)/algorythmTh.cpp $(ROOT)/common/runner.h $(ROOT)/common/nn_utils.h $(ROOT)/common/dataset.h
+	$(CXX) $(CXXFLAGS) -o $@ $(MT_DIR)/mainTh.cpp
+
+# Uso: make perf_smt SMT_CORES=0,4 THREADS=2 SEED=1 RUNS=5
+perf_smt: mt_build results_dir
+	@[ -n "$(SMT_CORES)" ] || { echo "ERROR: define SMT_CORES, ej: make $@ SMT_CORES=0,4"; exit 1; }
+	@PERF_TMP=$(abspath $(RESULTS_DIR))/.perf_tmp.csv; \
+	OUT=$(abspath $(RESULTS_DIR))/smt_th.csv; \
+	echo "threads,cores,run,task-clock (ms),cycles,instructions,cache-misses,mse" > $$OUT; \
+	for i in $$(seq 1 $(RUNS)); do \
+		MSE=$$(cd $(abspath $(MT_DIR)) && perf stat -x , \
+			-e $(PERF_EVENTS) \
+			-o $$PERF_TMP \
+			./main_th $(THREADS) $$i $(SMT_CORES)); \
+		TC=$$(grep 'task-clock'   $$PERF_TMP | cut -d',' -f1); \
+		CY=$$(grep 'cycles'       $$PERF_TMP | cut -d',' -f1); \
+		IN=$$(grep 'instructions' $$PERF_TMP | cut -d',' -f1); \
+		CM=$$(grep 'cache-misses' $$PERF_TMP | cut -d',' -f1); \
+		echo "$(THREADS),\"($(SMT_CORES))\",$$i,$$TC,$$CY,$$IN,$$CM,$$MSE" >> $$OUT; \
+	done; \
+	rm -f $$PERF_TMP
 
 clean:
 	@rm -f $(FGMT_BIN)

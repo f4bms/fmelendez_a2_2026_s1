@@ -55,9 +55,17 @@ static bool tryLoadDataset(const std::string& path,
 
 int main(int argc, char* argv[]) {
     int num_threads = 2;
+    uint32_t seed = 42u;
     if (argc >= 2) {
         try {
             num_threads = std::max(1, std::stoi(argv[1]));
+        } catch (...) {
+            return 1;
+        }
+    }
+    if (argc >= 3) {
+        try {
+            seed = static_cast<uint32_t>(std::stoul(argv[2]));
         } catch (...) {
             return 1;
         }
@@ -100,8 +108,8 @@ int main(int argc, char* argv[]) {
     vector<double> Y_test(Y_all.begin() + n_train, Y_all.end());
     
     // Crear scheduler y red neuronal
-    RoundRobinScheduler scheduler(num_threads, 1);
-    NeuralNetworkFineGrained nn(&scheduler);
+    RoundRobinScheduler scheduler(num_threads, 1, seed);
+    NeuralNetworkFineGrained nn(&scheduler, seed);
     
     auto start = high_resolution_clock::now();
     
