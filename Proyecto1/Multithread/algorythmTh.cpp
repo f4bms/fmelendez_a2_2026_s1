@@ -9,8 +9,6 @@
 #include <thread>
 #include <random>
 #include <algorithm>
-#include <pthread.h>
-#include <sched.h>
 
 #include "../common/nn_utils.h"
 #include "../common/dataset.h"
@@ -30,7 +28,6 @@ private:
     double output[OUTPUT_DIM];
 
     int num_threads;
-    vector<int> cpu_ids;
 
     // Helper: lanza hilos con scheduling estático strided y espera a que terminen.
     template <typename Fn>
@@ -39,12 +36,6 @@ private:
         threads.reserve(num_threads);
         for (int t = 0; t < num_threads; t++) {
             threads.emplace_back([&, t] {
-                if (!cpu_ids.empty()) {
-                    cpu_set_t cpuset;
-                    CPU_ZERO(&cpuset);
-                    CPU_SET(cpu_ids[t % (int)cpu_ids.size()], &cpuset);
-                    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-                }
                 for (int idx = t; idx < total_items; idx += num_threads) {
                     fn(idx, t);
                 }
@@ -54,8 +45,8 @@ private:
     }
 
 public:
-    explicit NeuralNetworkThreaded(int n_threads, vector<int> cores = {}, unsigned int fixed_seed = 42u)
-        : num_threads(max(1, n_threads)), cpu_ids(move(cores)) {
+    explicit NeuralNetworkThreaded(int n_threads, unsigned int fixed_seed = 42u)
+        : num_threads(max(1, n_threads)) {
         // RNG determinista, igual que CGMT/FGMT
         std::mt19937 rng(fixed_seed);
         std::uniform_real_distribution<double> uni(0.0, 1.0);
