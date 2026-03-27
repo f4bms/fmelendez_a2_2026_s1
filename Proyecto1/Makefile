@@ -161,7 +161,7 @@ perf_smt: mt_build results_dir
 	done; \
 	rm -f $$PERF_TMP
 
-# Uso: make perf_normal NORMAL_CORE=0 RUNS=5
+# Uso: make perf_normal NORMAL_CORE=0 RUNS=5 LABEL=normal
 # Appenda al mismo smt_th.csv; crea el header si el archivo no existe.
 perf_normal: normal_build results_dir
 	@PERF_TMP=$(abspath $(RESULTS_DIR))/.perf_tmp.csv; \
@@ -169,12 +169,13 @@ perf_normal: normal_build results_dir
 	if [ ! -f $$OUT ]; then \
 		echo "tipo,threads,cores,run,task-clock (s),cycles,instructions,cache-misses,branch-misses,context-switches,cpu-migrations,mse" > $$OUT; \
 	fi; \
-	cd $(abspath $(NORMAL_DIR)) && taskset -c $(NORMAL_CORE) ./main_normal $(SEED) > /dev/null 2>&1; \
+	echo "  [warmup] precargando dataset en page cache..."; \
+	cd $(abspath $(NORMAL_DIR)) && taskset -c $(NORMAL_CORE) ./main_normal $(SEED) > /dev/null 2>&1 && rm -f metrics.csv; \
 	for i in $$(seq 1 $(RUNS)); do \
 		MSE=$$(cd $(abspath $(NORMAL_DIR)) && perf stat -x , \
 			-e $(PERF_EVENTS) \
 			-o $$PERF_TMP \
-			taskset -c $(NORMAL_CORE) ./main_normal $$i); \
+			taskset -c $(NORMAL_CORE) ./main_normal $$i && rm -f metrics.csv); \
 		TC=$$(grep 'task-clock'              $$PERF_TMP | cut -d',' -f1 | awk '{printf "%.6f", $$1/1000000000}'); \
 		CY=$$(grep 'cycles'                  $$PERF_TMP | cut -d',' -f1); \
 		IN=$$(grep 'instructions'            $$PERF_TMP | cut -d',' -f1); \
@@ -182,7 +183,7 @@ perf_normal: normal_build results_dir
 		BM=$$(grep 'branch-misses'           $$PERF_TMP | cut -d',' -f1); \
 		CS=$$(grep 'context-switches'        $$PERF_TMP | cut -d',' -f1); \
 		MG=$$(grep 'cpu-migrations'          $$PERF_TMP | cut -d',' -f1); \
-		echo "normal,1,$(NORMAL_CORE),$$i,$$TC,$$CY,$$IN,$$CM,$$BM,$$CS,$$MG,$$MSE" >> $$OUT; \
+		echo "$(LABEL),1,\"($(NORMAL_CORE))\",$$i,$$TC,$$CY,$$IN,$$CM,$$BM,$$CS,$$MG,$$MSE" >> $$OUT; \
 	done; \
 	rm -f $$PERF_TMP
 

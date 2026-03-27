@@ -231,13 +231,7 @@ public:
                 // Backward pass
                 backward(input, Y[i], learning_rate);
             }
-            
-            // Mostrar progreso cada 100 épocas
-            if ((epoch + 1) % 100 == 0) {
-                double mse = total_loss / n_samples;
-                cout << "Epoch " << (epoch + 1) << "/" << epochs 
-                     << " - MSE: " << mse << endl;
-            }
+                    
         }
     }
 
