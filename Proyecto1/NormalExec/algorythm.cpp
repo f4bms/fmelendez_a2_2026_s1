@@ -2,9 +2,9 @@
 
 #include <iostream>
 #include <cstdlib>
-#include <ctime>
 #include <vector>
 #include <cstdint>
+#include <random>
 
 #include "../common/nn_utils.h"
 #include "../common/dataset.h"
@@ -39,6 +39,9 @@ private:
     double output_input[OUTPUT_DIM];       // Entrada a capa de salida
     double output[OUTPUT_DIM];             // Salida final
 
+    uint32_t stall_seed;
+    std::mt19937 weight_rng;
+
     // --- Métricas de simulación (sin hilos) ---
     long long cycle_mul_light_count = 0;
     long long cycle_mul_heavy_count = 0;
@@ -59,11 +62,10 @@ private:
         // Stall probabilístico por OpType, determinista por evento.
         // Mismas probabilidades y latencias que FGMT/CGMT.
         // Secuencial: no hay hiding, se paga el stall completo.
-        double miss_prob    = (op == DOT_PRODUCT) ? 2.4 : 0.6;  // %
-        long long stall_lat = (op == DOT_PRODUCT) ? 8LL  : 3LL; // ciclos
-        static constexpr uint32_t SEED = 42u;
-        uint32_t pct = random_det(SEED, tag, j, k, op) % 100u;
-        if (pct < static_cast<uint32_t>(miss_prob)) {
+        uint32_t miss_pct1000 = (op == DOT_PRODUCT) ? 24u : 6u; // 2.4% → 24/1000, 0.6% → 6/1000
+        long long stall_lat  = (op == DOT_PRODUCT) ? 8LL : 3LL; // ciclos
+        uint32_t pct = random_det(stall_seed, tag, j, k, op) % 1000u;
+        if (pct < miss_pct1000) {
             stall_count++;
             global_clock += stall_lat;
         }
@@ -90,28 +92,28 @@ private:
     }
     
 public:
-    NeuralNetwork() {
-        srand(time(NULL));
+    NeuralNetwork(uint32_t seed = 42u) : stall_seed(seed), weight_rng(seed) {
+        std::uniform_real_distribution<double> uni(0.0, 1.0);
 
         //Inicia los pesos al inicio no completamente random se usa una formula para que tenga sentido conforme a la cantidad de entradas y salidas
         for (int i = 0; i < INPUT_DIM; i++) {
             for (int j = 0; j < HIDDEN_NEURONS; j++) {
-                wh[i][j] = ((double)rand() / RAND_MAX - 0.5) * sqrt(2.0 / INPUT_DIM);
+                wh[i][j] = (uni(weight_rng) - 0.5) * sqrt(2.0 / INPUT_DIM);
             }
         }
-        
+
         // Inicializar bias hidden
         for (int j = 0; j < HIDDEN_NEURONS; j++) {
             bh[j] = 0.0;
         }
-        
+
         // Inicializar pesos de hidden a  output
         for (int i = 0; i < HIDDEN_NEURONS; i++) {
             for (int j = 0; j < OUTPUT_DIM; j++) {
-                wo[i][j] = ((double)rand() / RAND_MAX - 0.5) * sqrt(2.0 / HIDDEN_NEURONS);
+                wo[i][j] = (uni(weight_rng) - 0.5) * sqrt(2.0 / HIDDEN_NEURONS);
             }
         }
-        
+
         // Inicializa bias output
         for (int j = 0; j < OUTPUT_DIM; j++) {
             bo[j] = 0.0;

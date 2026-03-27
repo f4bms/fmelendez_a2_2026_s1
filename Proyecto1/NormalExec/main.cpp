@@ -1,6 +1,7 @@
 #include "algorythm.cpp"
 
 #include <chrono>
+#include <cstdint>
 #include <iomanip>
 #include <fstream>
 #include <filesystem>
@@ -45,7 +46,16 @@ static void append_metrics_csv(const std::string& tipo,
         << "\n";
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+    uint32_t seed = 42u;
+    if (argc >= 2) {
+        try {
+            seed = static_cast<uint32_t>(std::stoul(argv[1]));
+        } catch (...) {
+            return 1;
+        }
+    }
+
     // Cargar todos los datos
     vector<vector<double>> X_all;
     vector<double> Y_all;
@@ -58,8 +68,8 @@ int main() {
     auto& Y_train = split.Y_train;
     auto& X_test  = split.X_test;
     auto& Y_test  = split.Y_test;
-    
-    NeuralNetwork nn;
+
+    NeuralNetwork nn(seed);
 
     auto start = std::chrono::high_resolution_clock::now();
 
