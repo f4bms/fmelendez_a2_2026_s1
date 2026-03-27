@@ -1,23 +1,18 @@
 #include "algorythmTh.cpp"
 #include "../common/runner.h"
-#include <sstream>
 
 int main(int argc, char* argv[]) {
     int num_threads = 4;
     uint32_t seed = 42u;
-    vector<int> cores;
-
-    if (argc >= 2) num_threads = max(1, atoi(argv[1]));
-    if (argc >= 3) {
-        try { seed = static_cast<uint32_t>(std::stoul(argv[2])); }
-        catch (...) { return 1; }
+    if (argc >= 2) {
+        num_threads = max(1, atoi(argv[1]));
     }
-    if (argc >= 4) {
-        // parsea "0,4" → {0, 4}
-        stringstream ss(argv[3]);
-        string token;
-        while (getline(ss, token, ','))
-            cores.push_back(stoi(token));
+    if (argc >= 3) {
+        try {
+            seed = static_cast<uint32_t>(std::stoul(argv[2]));
+        } catch (...) {
+            return 1;
+        }
     }
 
     vector<vector<double>> X_all;
@@ -29,7 +24,7 @@ int main(int argc, char* argv[]) {
 
     auto split = split_train_test(X_all, Y_all, 0.8);
 
-    NeuralNetworkThreaded nn(num_threads, cores, seed);
+    NeuralNetworkThreaded nn(num_threads, seed);
     nn.train(split.X_train, split.Y_train, EPOCHS, LEARNING_RATE);
 
     double mse = nn.evaluate(split.X_test, split.Y_test);
