@@ -6,7 +6,9 @@ RUNS ?= 1
 SEED ?= 42
 
 # SMT perf — pasar SMT_CORES al invocar, ej: make perf_smt_all SMT_CORES=0,4
-PERF_EVENTS := task-clock,cpu_core/cycles/,cpu_core/instructions/,cpu_core/cache-misses/
+# stalled-cycles-backend = ciclos perdidos esperando memoria/ejecución (stalls de cache)
+# stalled-cycles-frontend = ciclos perdidos en fetch/decode de instrucciones
+PERF_EVENTS := task-clock,cpu_core/cycles/,cpu_core/instructions/,cpu_core/cache-misses/,cpu_core/stalled-cycles-backend/,cpu_core/stalled-cycles-frontend/
 
 ROOT := .
 RESULTS_DIR := $(ROOT)/results
@@ -19,7 +21,7 @@ CGMT_BIN := $(CGMT_DIR)/main_cgmt
 NORMAL_DIR := $(ROOT)/NormalExec
 NORMAL_BIN := $(NORMAL_DIR)/main_normal
 
-.PHONY: all clean results_dir build run50 cgmt_build cgmt_run50 normal_build
+.PHONY: all clean results_dir build run50 cgmt_build cgmt_run50 normal_build resultados graficas resultados_smt
 
 all: build
 
@@ -129,24 +131,53 @@ mt_build: $(MT_BIN)
 $(MT_BIN): $(MT_DIR)/mainTh.cpp $(MT_DIR)/algorythmTh.cpp $(ROOT)/common/runner.h $(ROOT)/common/nn_utils.h $(ROOT)/common/dataset.h
 	$(CXX) $(CXXFLAGS) -o $@ $(MT_DIR)/mainTh.cpp
 
-# Uso: make perf_smt SMT_CORES=0,4 THREADS=2 SEED=1 RUNS=5
+# Uso: make perf_smt SMT_CORES=0,4 THREADS=2 SEED=1 RUNS=5 LABEL=smt_par
+# LABEL es opcional (default: sin_label); se guarda como primera columna "tipo"
+# para identificar la corrida en el CSV sin afectar la ejecución del binario.
+LABEL ?= sin_label
+
 perf_smt: mt_build results_dir
 	@[ -n "$(SMT_CORES)" ] || { echo "ERROR: define SMT_CORES, ej: make $@ SMT_CORES=0,4"; exit 1; }
 	@PERF_TMP=$(abspath $(RESULTS_DIR))/.perf_tmp.csv; \
 	OUT=$(abspath $(RESULTS_DIR))/smt_th.csv; \
-	echo "threads,cores,run,task-clock (ms),cycles,instructions,cache-misses,mse" > $$OUT; \
+	echo "tipo,threads,cores,run,task-clock (s),cycles,instructions,cache-misses,stalls-backend,stalls-frontend,mse" > $$OUT; \
+	echo "  [warmup] precargando dataset en page cache..."; \
+	cd $(abspath $(MT_DIR)) && ./main_th $(THREADS) $(SEED) $(SMT_CORES) > /dev/null 2>&1; \
 	for i in $$(seq 1 $(RUNS)); do \
 		MSE=$$(cd $(abspath $(MT_DIR)) && perf stat -x , \
 			-e $(PERF_EVENTS) \
 			-o $$PERF_TMP \
 			./main_th $(THREADS) $$i $(SMT_CORES)); \
-		TC=$$(grep 'task-clock'   $$PERF_TMP | cut -d',' -f1); \
-		CY=$$(grep 'cycles'       $$PERF_TMP | cut -d',' -f1); \
-		IN=$$(grep 'instructions' $$PERF_TMP | cut -d',' -f1); \
-		CM=$$(grep 'cache-misses' $$PERF_TMP | cut -d',' -f1); \
-		echo "$(THREADS),\"($(SMT_CORES))\",$$i,$$TC,$$CY,$$IN,$$CM,$$MSE" >> $$OUT; \
+		TC=$$(grep 'task-clock'            $$PERF_TMP | cut -d',' -f1 | awk '{printf "%.6f", $$1/1000}'); \
+		CY=$$(grep 'cycles'                $$PERF_TMP | cut -d',' -f1); \
+		IN=$$(grep 'instructions'          $$PERF_TMP | cut -d',' -f1); \
+		CM=$$(grep 'cache-misses'          $$PERF_TMP | cut -d',' -f1); \
+		SB=$$(grep 'stalled-cycles-backend'  $$PERF_TMP | cut -d',' -f1); \
+		SF=$$(grep 'stalled-cycles-frontend' $$PERF_TMP | cut -d',' -f1); \
+		echo "$(LABEL),$(THREADS),\"($(SMT_CORES))\",$$i,$$TC,$$CY,$$IN,$$CM,$$SB,$$SF,$$MSE" >> $$OUT; \
 	done; \
 	rm -f $$PERF_TMP
+
+# ── Análisis y gráficas ───────────────────────────────────────────────────────
+# Uso: make graficas
+# Requiere que results/metrics.csv ya esté listo con los datos deseados.
+# Genera results/resultados.csv y results/graficas/*.png
+
+PYTHON ?= python3
+
+resultados:
+	@[ -s "$(RESULTS_DIR)/metrics.csv" ] || { echo "ERROR: $(RESULTS_DIR)/metrics.csv está vacío o no existe. Corre primero 'make metrics'."; exit 1; }
+	@echo "Calculando estadísticas..."
+	@$(PYTHON) $(RESULTS_DIR)/metrics.py
+
+graficas: resultados
+	@echo "Generando gráficas..."
+	@$(PYTHON) $(RESULTS_DIR)/graficas.py
+
+resultados_smt:
+	@[ -s "$(RESULTS_DIR)/smt_th.csv" ] || { echo "ERROR: $(RESULTS_DIR)/smt_th.csv está vacío o no existe. Corre primero 'make perf_smt'."; exit 1; }
+	@echo "Calculando estadísticas SMT..."
+	@$(PYTHON) $(RESULTS_DIR)/metrics_smt.py
 
 clean:
 	@rm -f $(FGMT_BIN)

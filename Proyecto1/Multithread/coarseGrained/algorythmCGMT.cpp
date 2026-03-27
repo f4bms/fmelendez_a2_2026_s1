@@ -1,14 +1,15 @@
-// Algoritmo de entrenamiento (coarse-grained multithreading - CGMT) con hilos.
-// - Solo hay 1 hilo "activo" a la vez (los demás esperan).
-// - La ÚNICA diferencia con FGMT debe ser el scheduler:
-//     * FGMT: round-robin por multiplicación.
-//     * CGMT: el hilo activo solo cambia cuando ocurre un stall.
-// - Por lo tanto, aquí:
-//     * Stalls: mismos criterios que FGMT (probabilidad por OpType, determinista por-evento).
-//     * Context switch: ocurre SIEMPRE que hay stall y existe otro hilo disponible.
+// Algoritmo de entrenamiento con scheduler coarse-grained (CGMT).
+//
+// Diferencia clave respecto a FGMT:
+//   FGMT → context switch después de CADA multiplicación (round-robin estricto).
+//   CGMT → el hilo activo ejecuta indefinidamente; solo cede el turno cuando
+//           ocurre un stall por cache miss.
+//
+// Ventaja de CGMT: cuando no hay stall, no hay overhead de context switch.
+// El stall hiding funciona igual que en FGMT: si hay otro hilo disponible,
+// ese hilo cubre la latencia del stall mientras el primero espera.
 #include <iostream>
 #include <cstdlib>
-#include <ctime>
 #include <vector>
 #include <thread>
 #include <mutex>
@@ -24,61 +25,45 @@
 using namespace std;
 using namespace std::chrono;
 
-// (constantes/funciones comunes están en common/)
-
-// Scheduler CGMT:
-// - Hay 1 hilo "activo" a la vez.
-// - El hilo activo ejecuta multiplicaciones en "ciclos" (global_clock++).
-// - Un stall ocurre cada N multiplicaciones "pesadas" del hilo activo, donde N es aleatorio
-//   en un rango configurable (por hilo).
-// - Al ocurrir un stall se agrega una latencia (stall_latency_cycles) y, típicamente, se hace
-//   un context switch (con una penalidad adicional). Con cierta probabilidad, el switch se omite.
+// CoarseGrainedScheduler: modela un procesador donde un solo hilo ejecuta
+// a la vez y solo lo cede cuando sufre un cache miss (stall).
+// Con múltiples hilos, el stall puede quedar oculto si el otro hilo hace
+// suficiente trabajo antes de devolver el turno → hiding de latencia.
 class CoarseGrainedScheduler {
 private:
 	int num_threads;
-	long long stall_latency_cycles; // cuántos ciclos dura el stall (sin computar)
+	long long stall_latency_cycles;
 	long long context_switch_penalty_cycles;
 
-	// Latencias alineadas con FGMT (mismas constantes/criterios).
+	// Latencias en ciclos por tipo de operación (mismos valores que FGMT
+	// para que las comparaciones entre variantes sean válidas).
+	//   LIGHT_DOT = 1: forward pass pipelined → 1 ciclo.
+	//   HEAVY_DOT = 3: backward pass, 3 etapas de pipeline.
+	//   HEAVY_ACT = 2: derivada de tanh (t*t, error*(1-tt)), deps FP → 2 ciclos.
 	static const long long LATENCY_LIGHT_DOT = 1;
-	static const long long LATENCY_LIGHT_ACT = 1;
 	static const long long LATENCY_HEAVY_DOT = 3;
 	static const long long LATENCY_HEAVY_ACT = 2;
 
-	// Métricas
 	long long cycle_mul_light_count;
 	long long cycle_mul_heavy_count;
-	long long uncounted_mul_count;
-	long long compute_multiplications; // (legacy) livianas + pesadas
-	long long total_multiplications;
 	long long stall_count;
-	long long stall_events_on_heavy_count;
 	long long context_switch_count;
-	long long fetch_count;
-	long long nop_count;
 	long long global_clock;
 
-	// Estado
 	uint32_t stall_seed;
 
 	int current_active_thread;
 	bool phase_open;
 	int phase_done_count;
 	vector<bool> thread_done;
-	vector<long long> thread_resume_clock; // ciclo mínimo en que cada hilo puede reanudar tras un stall
-
-	// Nota: antes había asignación dinámica por cola (next_index / take_next).
-	// En esta versión el reparto de trabajo es estático por hilo (strided) en la NN,
-	// así que el scheduler no administra índices de trabajo.
-	// Nota: en la versión anterior había un PRNG por hilo y un umbral aleatorio
-	// para disparar stalls. Ahora usamos el mismo criterio que FGMT:
-	// probabilístico por OpType, determinista por evento (tag,j,k).
+	vector<long long> thread_resume_clock;  // ciclo en que cada hilo puede reanudar tras un stall
 
 	mutex m;
 	condition_variable cv;
 
-	// Pseudo-random determinista (stateless), igual a FGMT, para reproducir el
-	// mismo patrón de stalls por evento sin depender del orden de ejecución.
+	// Hash determinista para simular cache misses reproducibles.
+	// Misma función que FGMT: dado el mismo (seed, tag, j, k, op),
+	// siempre produce el mismo resultado → stalls idénticos por evento.
 	static inline uint32_t random(uint32_t seed, uint32_t tag, int j, int k, OpType op) {
 		uint32_t x = seed;
 		x ^= tag * 31u;
@@ -91,14 +76,15 @@ private:
 		return x;
 	}
 
+	// Latencia de context switch aplicada cuando hay un stall y se cambia de hilo.
+	// En CGMT esto solo ocurre en el momento del stall, no en cada multiplicación.
 	long long pick_latency(bool is_heavy, OpType op) const {
-		if (!is_heavy) {
-			return (op == ACTIVATION) ? LATENCY_LIGHT_ACT : LATENCY_LIGHT_DOT;
-		} else {
-			return (op == ACTIVATION) ? LATENCY_HEAVY_ACT : LATENCY_HEAVY_DOT;
-		}
+		if (!is_heavy) return LATENCY_LIGHT_DOT;
+		return (op == ACTIVATION) ? LATENCY_HEAVY_ACT : LATENCY_HEAVY_DOT;
 	}
 
+	// Avanza current_active_thread al siguiente hilo que aún no terminó.
+	// Se llama solo cuando el hilo activo sufre un stall o llama a mark_done().
 	void switch_to_next_thread_locked() {
 		int next = (current_active_thread + 1) % num_threads;
 		int spins = 0;
@@ -111,6 +97,8 @@ private:
 		}
 	}
 
+	// Cuántos hilos no han llamado mark_done() todavía en esta fase.
+	// Se usa para decidir si hay otro hilo disponible para hacer hiding.
 	long long unfinished_threads_locked() const {
 		long long u = 0;
 		for (bool done : thread_done) {
@@ -121,20 +109,20 @@ private:
 
 public:
 	CoarseGrainedScheduler(int num_threads_arg,
-						   long long stall_latency_cycles_arg = 1,
-						   long long context_switch_penalty_cycles_arg = 1,
-						   uint32_t stall_seed_arg = 42u)
-		: num_threads(num_threads_arg), stall_latency_cycles(stall_latency_cycles_arg),
+	                       long long stall_latency_cycles_arg = 1,
+	                       long long context_switch_penalty_cycles_arg = 1,
+	                       uint32_t stall_seed_arg = 42u)
+		: num_threads(num_threads_arg),
+		  stall_latency_cycles(stall_latency_cycles_arg),
 		  context_switch_penalty_cycles(context_switch_penalty_cycles_arg),
 		  stall_seed(stall_seed_arg),
-		  cycle_mul_light_count(0), cycle_mul_heavy_count(0), uncounted_mul_count(0),
-		  compute_multiplications(0), total_multiplications(0),
-		  stall_count(0), stall_events_on_heavy_count(0), context_switch_count(0), fetch_count(0), nop_count(0),
+		  cycle_mul_light_count(0), cycle_mul_heavy_count(0),
+		  stall_count(0), context_switch_count(0),
 		  global_clock(0), current_active_thread(0), phase_open(false),
 		  phase_done_count(0), thread_done(num_threads_arg, false),
-		  thread_resume_clock(num_threads_arg, 0LL) {
-	}
+		  thread_resume_clock(num_threads_arg, 0LL) {}
 
+	// Abre una nueva fase: todos los hilos compiten por ser el activo inicial (hilo 0).
 	void begin_phase() {
 		unique_lock<mutex> lock(m);
 		phase_open = true;
@@ -145,6 +133,9 @@ public:
 		cv.notify_all();
 	}
 
+	// El hilo llama a mark_done() cuando termina todas sus neuronas.
+	// Si era el activo, el scheduler pasa el turno al siguiente hilo disponible.
+	// Cuando todos terminan, la fase se cierra automáticamente.
 	void mark_done(int thread_id) {
 		unique_lock<mutex> lock(m);
 		if (!phase_open) return;
@@ -170,40 +161,33 @@ public:
 
 	int get_num_threads() const { return num_threads; }
 
-	// Getters de métricas (para logging/CSV)
-	long long get_light_count() const { return cycle_mul_light_count; }
-	long long get_heavy_count() const { return cycle_mul_heavy_count; }
-	long long get_total_multiplications() const { return total_multiplications; }
-	long long get_stall_count() const { return stall_count; }
+	long long get_light_count()          const { return cycle_mul_light_count; }
+	long long get_heavy_count()          const { return cycle_mul_heavy_count; }
+	long long get_stall_count()          const { return stall_count; }
 	long long get_context_switch_count() const { return context_switch_count; }
-	long long get_global_clock() const { return global_clock; }
-	long long get_fetch_count() const { return fetch_count; }
+	long long get_global_clock()         const { return global_clock; }
 
+	// Bloqueo CGMT: el hilo espera hasta ser el activo.
+	// Diferencia con FGMT: aquí el hilo puede ejecutar muchas multiplicaciones
+	// seguidas sin ceder; solo espera si otro hilo tiene el turno.
+	// Si el hilo tuvo un stall y el otro no cubrió toda la latencia,
+	// se pagan los ciclos restantes al retomar el control.
 	void wait_active(int thread_id) {
 		unique_lock<mutex> lock(m);
 		cv.wait(lock, [&] { return !phase_open || current_active_thread == thread_id; });
-		// Si el stall de este hilo no fue completamente cubierto por el trabajo del otro hilo,
-		// se pagan los ciclos restantes ahora que retoma el control.
 		if (phase_open && global_clock < thread_resume_clock[thread_id]) {
 			global_clock = thread_resume_clock[thread_id];
 		}
 	}
 
-	// 1) Multiplicación normal: NO se contabiliza y NO consume ciclos del scheduler.
-	template <typename T>
-	T mul_normal(T a, T b) {
-		return a * b;
-	}
-
-	// 1b) Multiplicación NO contada como ciclo, pero SÍ registrada (útil para métricas).
-	template <typename T>
-	T mul_uncounted(T a, T b) {
-		uncounted_mul_count++;
-		total_multiplications++;
-		return a * b;
-	}
-
-	// Helper interno: cuerpo común de la multiplicación CGMT.
+	// Núcleo de la multiplicación CGMT (compartido por light y heavy).
+	// El hilo activo ejecuta la multiplicación y luego evalúa si hubo stall.
+	// Si hay stall y otro hilo disponible:
+	//   → se registra thread_resume_clock para el hiding,
+	//   → se cambia al otro hilo (context switch + su latencia),
+	//   → el otro hilo "cubre" los ciclos del stall mientras ejecuta.
+	// Si no hay otro hilo:
+	//   → se paga el stall completo sin hiding.
 	template <typename T>
 	T mul_cgmt_impl(int thread_id, T a, T b, bool is_heavy, OpType op, uint32_t tag, int j, int k) {
 		while (true) {
@@ -214,42 +198,29 @@ public:
 			if (!phase_open) return T{};
 			if (current_active_thread != thread_id) continue;
 
-			// Ejecutar 1 multiplicación del hilo activo (cuenta como 1 ciclo de cómputo).
-			compute_multiplications++;
-			total_multiplications++;
 			global_clock++;
 			T r = a * b;
 
-			// Contabilizar tipo de multiplicación.
-		if (is_heavy) {
-			cycle_mul_heavy_count++;
-		} else {
-			cycle_mul_light_count++;
-		}
+			if (is_heavy) cycle_mul_heavy_count++;
+			else          cycle_mul_light_count++;
 
-			// CGMT NO cambia de hilo salvo que ocurra stall.
-			// Con hiding: el otro hilo cubre los ciclos del stall mientras este espera.
-			// La penalidad real es solo el context switch; el stall queda oculto si el
-			// otro hilo hace suficiente trabajo antes de devolver el turno.
-			uint32_t miss_pct1000 = (op == DOT_PRODUCT) ? 24u : 6u; // 2.4% → 24/1000, 0.6% → 6/1000
-			long long stall_lat   = (op == DOT_PRODUCT) ? 8LL : 3LL; // ciclos del stall
+			// Probabilidades de cache miss (mismas que FGMT para comparabilidad):
+			//   DOT_PRODUCT: 2.4% de miss → 8 ciclos de stall
+			//   ACTIVATION:  0.6% de miss → 3 ciclos de stall
+			uint32_t miss_pct1000 = (op == DOT_PRODUCT) ? 24u : 6u;
+			long long stall_lat   = (op == DOT_PRODUCT) ? 8LL : 3LL;
 			uint32_t pct = random(stall_seed, tag, j, k, op) % 1000u;
 			if (pct < miss_pct1000) {
 				stall_count++;
-				if (is_heavy) stall_events_on_heavy_count++;
-
 				int old = current_active_thread;
 				if (unfinished_threads_locked() > 1) {
-					// Registrar cuándo puede reanudar este hilo (su stall termina en este ciclo).
 					thread_resume_clock[thread_id] = global_clock + stall_lat;
-					// Solo se paga el overhead del context switch; el stall lo oculta el otro hilo.
 					switch_to_next_thread_locked();
 					if (current_active_thread != old) {
 						context_switch_count++;
 						global_clock += pick_latency(is_heavy, op);
 					}
 				} else {
-					// Solo 1 hilo activo: no hay hiding, se paga el stall completo.
 					global_clock += stall_lat;
 				}
 				cv.notify_all();
@@ -259,54 +230,35 @@ public:
 		}
 	}
 
-	// 2) Multiplicación liviana: se cuenta como ciclo (NO cambia de hilo salvo stall).
+	// mul_cgmt_light: multiplicación forward pass (w*x).
+	// No cambia de hilo salvo cache miss; contribuye a los ciclos del reloj.
 	template <typename T>
 	T mul_cgmt_light(int thread_id, T a, T b, OpType op, uint32_t tag, int j, int k) {
 		return mul_cgmt_impl(thread_id, a, b, false, op, tag, j, k);
 	}
 
-	// 3) Multiplicación pesada: se cuenta como ciclo y puede provocar stalls (y, por ende, switches).
+	// mul_cgmt_heavy: multiplicación backward pass (w*δ, t*t, error*(1-tt)).
+	// Misma lógica que light pero con mayor latencia de context switch y
+	// mayor probabilidad de cache miss (gradientes, peor localidad).
 	template <typename T>
 	T mul_cgmt_heavy(int thread_id, T a, T b, OpType op, uint32_t tag, int j, int k) {
 		return mul_cgmt_impl(thread_id, a, b, true, op, tag, j, k);
 	}
 
-	template <typename T>
-	T mul_cgmt(int thread_id, T a, T b) {
-		// Compatibilidad: por defecto se considera liviana.
-			return mul_cgmt_light(thread_id, a, b, DOT_PRODUCT, 0u, 0, 0);
-	}
-
+	// mul_total: operaciones fuera del modelo de ciclos (lr*grad, error²).
+	// No consume global_clock ni provoca stalls; es solo una multiplicación escalar.
 	template <typename T>
 	T mul_total(T a, T b) {
-		return mul_uncounted(a, b);
-	}
-
-	void idle_cgmt(int thread_id) {
-		wait_active(thread_id);
-		if (!is_phase_open()) return;
-		unique_lock<mutex> lock(m);
-		if (!phase_open || current_active_thread != thread_id) return;
-		nop_count++;
-		global_clock++;
-		cv.notify_all();
-	}
-
-	void print_stats() {
-		long long cycle_muls = cycle_mul_light_count + cycle_mul_heavy_count;
-		cout << "\n --- metricas ---" << endl;
-		cout << "mult light:  " << cycle_mul_light_count << endl;
-		cout << "mult heavy:  " << cycle_mul_heavy_count << endl;
-		cout << "fetches (take_next): " << fetch_count << endl;
-		cout << "mult fuera de ciclos: " << uncounted_mul_count << endl;
-		cout << "total mult en ciclos: " << cycle_muls << endl;
-		cout << "context switches:               " << context_switch_count << endl;
-		cout << "NOPs por stall:                   " << stall_count << endl;
-		cout << "ciclos simulados:  " << global_clock << endl;
-		cout << "----------------------\n" << endl;
+		return a * b;
 	}
 };
 
+// Red neuronal de una capa oculta con scheduler CGMT.
+// Estructura idéntica a la variante FGMT, con dos diferencias:
+//   1. Se usa CoarseGrainedScheduler en lugar de RoundRobinScheduler.
+//   2. Cada lambda llama a mark_done() al terminar, en lugar de
+//      yield_turns_until_closed() + atómico, porque en CGMT el hilo
+//      activo simplemente se cede cuando marca que terminó.
 class NeuralNetworkCoarseGrained {
 private:
 	double wh[INPUT_DIM][HIDDEN_NEURONS];
@@ -322,31 +274,32 @@ private:
 	CoarseGrainedScheduler* scheduler;
 
 public:
+	// Inicialización de Xavier con seed fija para resultados reproducibles
+	// y comparables entre variantes (normal, cgmt, fgmt con misma seed).
 	NeuralNetworkCoarseGrained(CoarseGrainedScheduler* sched, unsigned int fixed_seed = 42u) : scheduler(sched) {
-		// RNG determinista (evita rand()/srand())
 		std::mt19937 rng;
 		rng.seed(fixed_seed);
 		std::uniform_real_distribution<double> uni(0.0, 1.0);
-		for (int i = 0; i < INPUT_DIM; i++) {
-			for (int j = 0; j < HIDDEN_NEURONS; j++) {
+		for (int i = 0; i < INPUT_DIM; i++)
+			for (int j = 0; j < HIDDEN_NEURONS; j++)
 				wh[i][j] = (uni(rng) - 0.5) * sqrt(2.0 / INPUT_DIM);
-			}
-		}
 		for (int j = 0; j < HIDDEN_NEURONS; j++) bh[j] = 0.0;
-		for (int i = 0; i < HIDDEN_NEURONS; i++) {
-			for (int j = 0; j < OUTPUT_DIM; j++) {
+		for (int i = 0; i < HIDDEN_NEURONS; i++)
+			for (int j = 0; j < OUTPUT_DIM; j++)
 				wo[i][j] = (uni(rng) - 0.5) * sqrt(2.0 / HIDDEN_NEURONS);
-			}
-		}
 		for (int j = 0; j < OUTPUT_DIM; j++) bo[j] = 0.0;
 	}
 
-	// Forward propagation (CGMT)
+	// Forward pass en dos fases separadas por un join().
+	// Fase 1 (hidden): cada hilo calcula sus neuronas ocultas (w*x + b → tanh).
+	// Fase 2 (output): cada hilo acumula su parte de la suma ponderada de hidden.
+	// El join actúa como barrera: fase 2 no empieza hasta que todos los hilos
+	// de fase 1 llamaron a mark_done().
 	double forward_cgmt(const double input[]) {
 		vector<thread> threads;
 		int num_threads = scheduler->get_num_threads();
 
-		// Capa oculta
+		// --- Fase 1: capa oculta ---
 		scheduler->begin_phase();
 		auto compute_hidden = [&](int tid) {
 			for (int j = tid; j < HIDDEN_NEURONS; j += num_threads) {
@@ -362,7 +315,7 @@ public:
 		for (int t = 0; t < num_threads; t++) threads.emplace_back(compute_hidden, t);
 		for (auto& t : threads) t.join();
 
-		// Capa de salida
+		// --- Fase 2: capa de salida ---
 		scheduler->begin_phase();
 		for (int outj = 0; outj < OUTPUT_DIM; outj++) output_input[outj] = bo[outj];
 
@@ -383,8 +336,15 @@ public:
 		return output[0];
 	}
 
-	// Backpropagation (CGMT)
+	// Backward pass en cuatro fases (misma estructura que FGMT).
+	//
+	// Fase 1: hidden_error = woᵀ * output_delta; hidden_delta = error * tanh'(x)
+	//         tanh'(x) = 1 - tanh²(x) modelado como 2 mul_heavy de ACTIVATION.
+	// Fase 2: wo -= lr * output_delta * hidden_outputᵀ
+	// Fase 3: wh -= lr * hidden_delta * inputᵀ
+	// Fase 4: bias (mul_total, fuera de ciclos)
 	void backward_cgmt(const double input[], double target, double learning_rate) {
+		// Gradiente de MSE: dL/dy = y - target
 		double output_delta[OUTPUT_DIM];
 		for (int j = 0; j < OUTPUT_DIM; j++) output_delta[j] = output[j] - target;
 
@@ -394,7 +354,7 @@ public:
 		int num_threads = scheduler->get_num_threads();
 		vector<thread> threads;
 
-		// Cálculo de hidden_error y hidden_delta
+		// --- Fase 1: error y delta de la capa oculta ---
 		scheduler->begin_phase();
 		auto compute_hidden_error = [&](int tid) {
 			for (int j = tid; j < HIDDEN_NEURONS; j += num_threads) {
@@ -402,12 +362,10 @@ public:
 				for (int k = 0; k < OUTPUT_DIM; k++) {
 					hidden_error[j] += scheduler->mul_cgmt_heavy(tid, output_delta[k], wo[j][k], DOT_PRODUCT, 30u, j, k);
 				}
-
-				// Igual que FGMT: derivada tanh modelada como 2 multiplicaciones "heavy" de tipo ACTIVATION.
-				// 1) tt = t * t
+				// tanh'(x) = 1 - tanh²(x): dos mul_heavy de ACTIVATION porque
+				// t*t y error*(1-tt) son ops FP dependientes con mayor latencia.
 				double t = tanh(hidden_input[j]);
 				double tt = scheduler->mul_cgmt_heavy(tid, t, t, ACTIVATION, 31u, j, 0);
-				// 2) hidden_delta = hidden_error * (1 - tt)
 				hidden_delta[j] = scheduler->mul_cgmt_heavy(tid, hidden_error[j], (1.0 - tt), ACTIVATION, 32u, j, 0);
 			}
 			scheduler->mark_done(tid);
@@ -416,7 +374,7 @@ public:
 		for (int t = 0; t < num_threads; t++) threads.emplace_back(compute_hidden_error, t);
 		for (auto& t : threads) t.join();
 
-		// Actualización de wo
+		// --- Fase 2: actualizar pesos hidden → output ---
 		scheduler->begin_phase();
 		threads.clear();
 		auto update_wo = [&](int tid) {
@@ -431,10 +389,10 @@ public:
 		for (int t = 0; t < num_threads; t++) threads.emplace_back(update_wo, t);
 		for (auto& t : threads) t.join();
 
-		// Bias de salida
+		// Bias de salida fuera de ciclos
 		for (int j = 0; j < OUTPUT_DIM; j++) bo[j] -= scheduler->mul_total(learning_rate, output_delta[j]);
 
-		// Actualización de wh
+		// --- Fase 3: actualizar pesos input → hidden ---
 		scheduler->begin_phase();
 		threads.clear();
 		auto update_wh = [&](int tid) {
@@ -449,7 +407,7 @@ public:
 		for (int t = 0; t < num_threads; t++) threads.emplace_back(update_wh, t);
 		for (auto& t : threads) t.join();
 
-		// Bias de capa oculta
+		// Bias de capa oculta fuera de ciclos
 		for (int j = 0; j < HIDDEN_NEURONS; j++) bh[j] -= scheduler->mul_total(learning_rate, hidden_delta[j]);
 	}
 

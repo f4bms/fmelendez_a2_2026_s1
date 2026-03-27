@@ -131,4 +131,45 @@ fig.savefig(OUT_DIR / "speedup_cgmt.png", bbox_inches="tight", dpi=150)
 plt.close(fig)
 print("  guardada: speedup_cgmt.png")
 
+# ── SpeedUp comparado: FGMT vs CGMT ──────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.plot(fgmt["hilos"], fgmt["SpeedUp"],
+        marker="o", color="#2196F3", linewidth=2, markersize=8, label="FGMT")
+ax.plot(cgmt["hilos"], cgmt["SpeedUp"],
+        marker="s", color="#FF9800", linewidth=2, markersize=8, label="CGMT")
+ax.set_xlabel("Hilos")
+ax.set_ylabel("SpeedUp")
+ax.set_title("SpeedUp vs Hilos — FGMT vs CGMT")
+ax.set_xticks(sorted(set(fgmt["hilos"].tolist() + cgmt["hilos"].tolist())))
+ax.legend()
+ax.grid(axis="y", linestyle="--", alpha=0.5)
+fig.savefig(OUT_DIR / "speedup_comparado.png", bbox_inches="tight", dpi=150)
+plt.close(fig)
+print("  guardada: speedup_comparado.png")
+
+
+# ── Boxplot por tipo: un gráfico por cada tipo en metrics.csv ─────────────────
+COLORES = {"fgmt": "#90CAF9", "cgmt": "#FFCC80", "normal": "#A5D6A7"}
+
+for tipo, grupo_tipo in raw.groupby("tipo"):
+    # Agrupar por cantidad de hilos dentro del tipo
+    grupos_box = grupo_tipo.groupby("cant_threads")["ciclos_simulados"]
+    data_box   = [g.values for _, g in grupos_box]
+    labels_box = [f"{h} hilo{'s' if h != 1 else ''}" for h, _ in grupos_box]
+
+    color = COLORES.get(tipo, "#CE93D8")
+    fig, ax = plt.subplots(figsize=(max(5, len(labels_box) * 1.6), 5))
+    ax.boxplot(data_box, labels=labels_box, patch_artist=True,
+               boxprops=dict(facecolor=color, color="#333333"),
+               medianprops=dict(color="#E53935", linewidth=2))
+    ax.set_ylabel("Ciclos simulados")
+    ax.set_title(f"Distribución de ciclos — {tipo.upper()}")
+    ax.tick_params(axis="x", rotation=20)
+    ax.grid(axis="y", linestyle="--", alpha=0.5)
+    fig.tight_layout()
+    fname = f"boxplot_{tipo}.png"
+    fig.savefig(OUT_DIR / fname, bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    print(f"  guardada: {fname}")
+
 print(f"\nGráficas guardadas en: {OUT_DIR}/")

@@ -1,8 +1,11 @@
-/* Algoritmo de entrenamiento de una red neuronal utilizando multithreading
-- Scheduling estático strided: cada hilo procesa neuronas j = tid, tid+T, tid+2T, ...
-- Sin cola de tareas, igual que FGMT y CGMT.
-- Inicialización de pesos determinista (mt19937 con seed fija).
-*/
+// Red neuronal multihilo con paralelismo real (sin simulación de scheduler).
+// A diferencia de CGMT y FGMT, aquí los hilos corren en paralelo verdadero:
+// no hay round-robin ni turnos; el SO planifica los hilos libremente.
+// No se miden ciclos simulados ni stalls, solo el tiempo de pared.
+//
+// Distribución de trabajo: scheduling estático strided.
+//   El hilo t procesa los índices t, t+T, t+2T, ...
+//   Cada neurona/fila es independiente → sin condiciones de carrera.
 #include <iostream>
 #include <cstdlib>
 #include <vector>
@@ -24,12 +27,13 @@ private:
 
     double hidden_input[HIDDEN_NEURONS];
     double hidden_output[HIDDEN_NEURONS];
-    double output_input[OUTPUT_DIM];
     double output[OUTPUT_DIM];
 
     int num_threads;
 
-    // Helper: lanza hilos con scheduling estático strided y espera a que terminen.
+    // Lanza num_threads hilos con scheduling estático strided sobre [0, total_items).
+    // fn(idx, tid): idx es el índice de la iteración, tid el id del hilo.
+    // Bloquea hasta que todos los hilos terminan.
     template <typename Fn>
     void parallel_strided(int total_items, Fn fn) {
         vector<thread> threads;
@@ -45,31 +49,32 @@ private:
     }
 
 public:
+    // Inicialización de Xavier con seed fija para comparaciones reproducibles
+    // entre variantes (normal, cgmt, fgmt, threaded con la misma seed).
     explicit NeuralNetworkThreaded(int n_threads, unsigned int fixed_seed = 42u)
         : num_threads(max(1, n_threads)) {
-        // RNG determinista, igual que CGMT/FGMT
         std::mt19937 rng(fixed_seed);
         std::uniform_real_distribution<double> uni(0.0, 1.0);
 
-        for (int i = 0; i < INPUT_DIM; i++) {
-            for (int j = 0; j < HIDDEN_NEURONS; j++) {
+        for (int i = 0; i < INPUT_DIM; i++)
+            for (int j = 0; j < HIDDEN_NEURONS; j++)
                 wh[i][j] = (uni(rng) - 0.5) * sqrt(2.0 / INPUT_DIM);
-            }
-        }
 
         for (int j = 0; j < HIDDEN_NEURONS; j++) bh[j] = 0.0;
 
-        for (int i = 0; i < HIDDEN_NEURONS; i++) {
-            for (int j = 0; j < OUTPUT_DIM; j++) {
+        for (int i = 0; i < HIDDEN_NEURONS; i++)
+            for (int j = 0; j < OUTPUT_DIM; j++)
                 wo[i][j] = (uni(rng) - 0.5) * sqrt(2.0 / HIDDEN_NEURONS);
-            }
-        }
 
         for (int j = 0; j < OUTPUT_DIM; j++) bo[j] = 0.0;
     }
 
+    // Forward pass en dos etapas.
+    // Capa oculta: cada neurona j es independiente → strided en paralelo.
+    // Capa de salida: secuencial porque la acumulación sobre hidden_output[]
+    //   requeriría sincronización si se paralelizara por hilo de hidden.
+    //   Con OUTPUT_DIM=1 el bucle es trivial de todas formas.
     double forward(const double input[]) {
-        // Capa oculta: cada neurona j es independiente → strided por hilo.
         parallel_strided(HIDDEN_NEURONS, [&](int j, int /*tid*/) {
             double sum = bh[j];
             for (int i = 0; i < INPUT_DIM; i++) {
@@ -79,26 +84,33 @@ public:
             hidden_output[j] = tanh_activation(sum);
         });
 
-        // Capa de salida: OUTPUT_DIM=1, secuencial (sin races).
         for (int outj = 0; outj < OUTPUT_DIM; outj++) {
             double sum = bo[outj];
             for (int i = 0; i < HIDDEN_NEURONS; i++) {
                 sum += hidden_output[i] * wo[i][outj];
             }
-            output_input[outj] = sum;
             output[outj] = sum;
         }
 
         return output[0];
     }
 
+    // Backward pass en cinco etapas.
+    // Las etapas paralelas son seguras porque cada hilo escribe en índices distintos.
+    //
+    // 1. hidden_delta: error * tanh'(x) = error * (1 - tanh²(x)), independiente por j.
+    // 2. wo -= lr * output_delta * hidden_outputᵀ, independiente por fila i.
+    // 3. Bias output: OUTPUT_DIM=1, secuencial.
+    // 4. wh -= lr * hidden_delta * inputᵀ, strided por columna j (wh[*][j]).
+    // 5. Bias hidden: independiente por j.
     void backward(const double input[], double target, double learning_rate) {
+        // Gradiente de MSE: dL/dy = y - target
         double output_delta[OUTPUT_DIM];
         for (int j = 0; j < OUTPUT_DIM; j++) {
             output_delta[j] = output[j] - target;
         }
 
-        // hidden_delta[j]: independiente por neurona → strided.
+        // Etapa 1: delta de la capa oculta
         double hidden_delta[HIDDEN_NEURONS];
         parallel_strided(HIDDEN_NEURONS, [&](int j, int /*tid*/) {
             double hidden_error = 0.0;
@@ -109,26 +121,26 @@ public:
             hidden_delta[j] = hidden_error * (1.0 - t * t);
         });
 
-        // Actualizar wo: independiente por fila i (OUTPUT_DIM=1).
+        // Etapa 2: actualizar wo
         parallel_strided(HIDDEN_NEURONS, [&](int i, int /*tid*/) {
             for (int j = 0; j < OUTPUT_DIM; j++) {
                 wo[i][j] -= learning_rate * output_delta[j] * hidden_output[i];
             }
         });
 
-        // Bias output: secuencial.
+        // Etapa 3: bias de salida (escalar)
         for (int j = 0; j < OUTPUT_DIM; j++) {
             bo[j] -= learning_rate * output_delta[j];
         }
 
-        // Actualizar wh: cada hilo actualiza columnas wh[*][j] → strided por j.
+        // Etapa 4: actualizar wh (strided por columna j para evitar races en wh[i][j])
         parallel_strided(HIDDEN_NEURONS, [&](int j, int /*tid*/) {
             for (int i = 0; i < INPUT_DIM; i++) {
                 wh[i][j] -= learning_rate * hidden_delta[j] * input[i];
             }
         });
 
-        // Bias hidden: strided por j.
+        // Etapa 5: bias oculto
         parallel_strided(HIDDEN_NEURONS, [&](int j, int /*tid*/) {
             bh[j] -= learning_rate * hidden_delta[j];
         });
