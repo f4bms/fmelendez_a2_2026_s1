@@ -19,7 +19,7 @@ CGMT_BIN := $(CGMT_DIR)/main_cgmt
 NORMAL_DIR := $(ROOT)/NormalExec
 NORMAL_BIN := $(NORMAL_DIR)/main_normal
 
-.PHONY: all clean results_dir build run50 cgmt_build cgmt_run50 normal_build resultados graficas resultados_smt
+.PHONY: all clean results_dir build run50 cgmt_build cgmt_run50 normal_build resultados graficas resultados_smt graficas_smt
 
 all: build
 
@@ -207,6 +207,10 @@ resultados_smt:
 	@[ -s "$(RESULTS_DIR)/smt_th.csv" ] || { echo "ERROR: $(RESULTS_DIR)/smt_th.csv está vacío o no existe. Corre primero 'make perf_smt'."; exit 1; }
 	@echo "Calculando estadísticas SMT..."
 	@$(PYTHON) $(RESULTS_DIR)/metrics_smt.py
+
+graficas_smt: resultados_smt
+	@echo "Generando gráficas SMT..."
+	@$(PYTHON) $(RESULTS_DIR)/graficas_smt.py
 
 clean:
 	@rm -f $(FGMT_BIN)

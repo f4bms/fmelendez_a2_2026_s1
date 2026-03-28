@@ -20,9 +20,12 @@ def load_csv(path):
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            tc_str = row.get("task-clock (s)", "").strip()
+            if not tc_str:
+                continue
             tipo    = row["tipo"]
             threads = int(row["threads"])
-            grupos[(tipo, threads)].append(float(row["task-clock (s)"]))
+            grupos[(tipo, threads)].append(float(tc_str))
     return grupos
 
 # =========================
