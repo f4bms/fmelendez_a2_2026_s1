@@ -3,7 +3,7 @@ Proyecto I — Arquitectura II (2026 S1)
 
 ## Descripción
 
-Implementación y análisis de rendimiento de una red neuronal feed-forward (3 → 70 → 1) bajo distintos modelos de threading y scheduling. El objetivo es medir el impacto del **SMT (Simultaneous Multi-Threading)** sobre ciclos, instrucciones, cache-misses y tiempo de ejecución.
+Implementación y análisis de rendimiento de una red neuronal feed-forward (3 → 30 → 1) bajo distintos modelos de threading y scheduling.
 
 Se comparan cuatro variantes:
 

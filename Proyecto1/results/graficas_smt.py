@@ -13,7 +13,7 @@ df  = pd.read_csv(CSV_PATH)
 
 # Leer smt_th.csv con soporte para filas de 9 y 12 columnas.
 # smt/smtoff: 9 cols (sin branch-misses/ctx-switches/cpu-migrations)
-# normal/cgmt: 12 cols (con esos campos extra)
+# normal/cmp: 12 cols (con esos campos extra)
 # csv.reader maneja los campos entre comillas con comas internas (ej. "(0,1)").
 _rows = []
 with open(METRICS_PATH, newline="") as _f:
@@ -46,10 +46,10 @@ n_smtoff = get_n("smtoff", 2)
 
 smt    = df[df["tipo"] == "smt"].sort_values("hilos")
 smtoff = df[df["tipo"] == "smtoff"].sort_values("hilos")
-cgmt   = df[df["tipo"] == "cgmt"].sort_values("hilos")
+cmp   = df[df["tipo"] == "cmp"].sort_values("hilos")
 normal = df[df["tipo"] == "normal"].iloc[0]
 
-# -- Tiempo de ejecución vs Hilos – SMT vs SMT-OFF vs CGMT (comparado) --------
+# -- Tiempo de ejecución vs Hilos – SMT vs SMT-OFF vs CMP (comparado) --------
 fig, ax = plt.subplots(figsize=(7, 4))
 ax.plot(smt["hilos"], smt["media_aritmetica"],
         marker="o", color="#2196F3", linewidth=2, markersize=8, label="SMT")
@@ -60,23 +60,23 @@ ax.fill_between(
     alpha=0.15, color="#2196F3", label="IC 95% SMT"
 )
 ax.plot(smtoff["hilos"], smtoff["media_aritmetica"],
-        marker="s", color="#FF9800", linewidth=0, markersize=10, label="SMT-OFF")
+        marker="s", color="#FF9800", linewidth=2, markersize=10, label="SMT-OFF")
 ax.errorbar(smtoff["hilos"], smtoff["media_aritmetica"],
             yerr=smtoff["IC"],
             fmt="none", ecolor="#FF9800", capsize=6, capthick=1.5)
-if not cgmt.empty:
-    ax.plot(cgmt["hilos"], cgmt["media_aritmetica"],
-            marker="^", color="#4CAF50", linewidth=2, markersize=8, label="CGMT")
+if not cmp.empty:
+    ax.plot(cmp["hilos"], cmp["media_aritmetica"],
+            marker="^", color="#4CAF50", linewidth=2, markersize=8, label="CMP")
     ax.fill_between(
-        cgmt["hilos"],
-        cgmt["media_aritmetica"] - cgmt["IC"],
-        cgmt["media_aritmetica"] + cgmt["IC"],
-        alpha=0.15, color="#4CAF50", label="IC 95% CGMT"
+        cmp["hilos"],
+        cmp["media_aritmetica"] - cmp["IC"],
+        cmp["media_aritmetica"] + cmp["IC"],
+        alpha=0.15, color="#4CAF50", label="IC 95% CMP"
     )
 ax.set_xlabel("Hilos")
 ax.set_ylabel("Tiempo de ejecución (s)")
-ax.set_title("Tiempo de Ejecución vs Hilos – SMT vs SMT-OFF vs CGMT")
-all_hilos = smt["hilos"].tolist() + smtoff["hilos"].tolist() + (cgmt["hilos"].tolist() if not cgmt.empty else [])
+ax.set_title("Tiempo de Ejecución vs Hilos – SMT vs SMT-OFF vs CMP")
+all_hilos = smt["hilos"].tolist() + smtoff["hilos"].tolist() + (cmp["hilos"].tolist() if not cmp.empty else [])
 ax.set_xticks(sorted(set(all_hilos)))
 ax.legend()
 ax.grid(axis="y", linestyle="--", alpha=0.5)
@@ -84,19 +84,19 @@ fig.savefig(OUT_DIR / "tiempo_comparado.png", bbox_inches="tight", dpi=150)
 plt.close(fig)
 print("  guardada: tiempo_comparado.png")
 
-# -- Eficiencia vs Hilos – SMT vs SMT-OFF vs CGMT (comparado) -----------------
+# -- Eficiencia vs Hilos – SMT vs SMT-OFF vs CMP (comparado) -----------------
 fig, ax = plt.subplots(figsize=(7, 4))
 ax.plot(smt["hilos"], smt["Eficiencia"],
         marker="o", color="#2196F3", linewidth=2, markersize=8, label="SMT")
 ax.plot(smtoff["hilos"], smtoff["Eficiencia"],
-        marker="s", color="#FF9800", linewidth=0, markersize=10, label="SMT-OFF")
-if not cgmt.empty:
-    ax.plot(cgmt["hilos"], cgmt["Eficiencia"],
-            marker="^", color="#4CAF50", linewidth=2, markersize=8, label="CGMT")
+        marker="s", color="#FF9800", linewidth=2, markersize=10, label="SMT-OFF")
+if not cmp.empty:
+    ax.plot(cmp["hilos"], cmp["Eficiencia"],
+            marker="^", color="#4CAF50", linewidth=2, markersize=8, label="CMP")
 ax.set_xlabel("Hilos")
 ax.set_ylabel("Eficiencia")
-ax.set_title("Eficiencia vs Hilos – SMT vs SMT-OFF vs CGMT")
-all_hilos = smt["hilos"].tolist() + smtoff["hilos"].tolist() + (cgmt["hilos"].tolist() if not cgmt.empty else [])
+ax.set_title("Eficiencia vs Hilos – SMT vs SMT-OFF vs CMP")
+all_hilos = smt["hilos"].tolist() + smtoff["hilos"].tolist() + (cmp["hilos"].tolist() if not cmp.empty else [])
 ax.set_xticks(sorted(set(all_hilos)))
 ax.legend()
 ax.grid(axis="y", linestyle="--", alpha=0.5)
@@ -104,31 +104,19 @@ fig.savefig(OUT_DIR / "eficiencia_comparado.png", bbox_inches="tight", dpi=150)
 plt.close(fig)
 print("  guardada: eficiencia_comparado.png")
 
-# -- SpeedUp vs Hilos – SMTOFF (barra) ----------------------------------------
-fig, ax = plt.subplots(figsize=(4, 4))
-ax.bar("SMT-OFF\n2 hilos", smtoff["SpeedUp"].iloc[0],
-       color="#FF9800", width=0.4, label="SMT-OFF")
-ax.set_ylabel("SpeedUp")
-ax.set_title(f"SpeedUp – SMT-OFF (N={n_smtoff})")
-ax.legend()
-ax.grid(axis="y", linestyle="--", alpha=0.5)
-fig.savefig(OUT_DIR / "speedup_smtoff.png", bbox_inches="tight", dpi=150)
-plt.close(fig)
-print("  guardada: speedup_smtoff.png")
-
-# -- SpeedUp comparado: SMT vs SMT-OFF vs CGMT --------------------------------
+# -- SpeedUp comparado: SMT vs SMT-OFF vs CMP --------------------------------
 fig, ax = plt.subplots(figsize=(7, 4))
 ax.plot(smt["hilos"], smt["SpeedUp"],
         marker="o", color="#2196F3", linewidth=2, markersize=8, label="SMT")
 ax.plot(smtoff["hilos"], smtoff["SpeedUp"],
-        marker="s", color="#FF9800", linewidth=0, markersize=10, label="SMT-OFF")
-if not cgmt.empty:
-    ax.plot(cgmt["hilos"], cgmt["SpeedUp"],
-            marker="^", color="#4CAF50", linewidth=2, markersize=8, label="CGMT")
+        marker="s", color="#FF9800", linewidth=2, markersize=10, label="SMT-OFF")
+if not cmp.empty:
+    ax.plot(cmp["hilos"], cmp["SpeedUp"],
+            marker="^", color="#4CAF50", linewidth=2, markersize=8, label="CMP")
 ax.set_xlabel("Hilos")
 ax.set_ylabel("SpeedUp")
-ax.set_title("SpeedUp vs Hilos – SMT vs SMT-OFF vs CGMT")
-all_hilos = smt["hilos"].tolist() + smtoff["hilos"].tolist() + (cgmt["hilos"].tolist() if not cgmt.empty else [])
+ax.set_title("SpeedUp vs Hilos – SMT vs SMT-OFF vs CMP")
+all_hilos = smt["hilos"].tolist() + smtoff["hilos"].tolist() + (cmp["hilos"].tolist() if not cmp.empty else [])
 ax.set_xticks(sorted(set(all_hilos)))
 ax.legend()
 ax.grid(axis="y", linestyle="--", alpha=0.5)
@@ -136,10 +124,10 @@ fig.savefig(OUT_DIR / "speedup_comparado.png", bbox_inches="tight", dpi=150)
 plt.close(fig)
 print("  guardada: speedup_comparado.png")
 
-# -- Boxplot distribución de tiempos – SMT, SMT-OFF y CGMT -------------------
-COLORES = {"smt": "#90CAF9", "smtoff": "#FFCC80", "cgmt": "#A5D6A7"}
+# -- Boxplot distribución de tiempos – SMT, SMT-OFF y CMP -------------------
+COLORES = {"smt": "#90CAF9", "smtoff": "#FFCC80", "cmp": "#A5D6A7"}
 
-for tipo in ("smt", "smtoff", "cgmt"):
+for tipo in ("smt", "smtoff", "cmp"):
     grupo_tipo = raw[raw["tipo"] == tipo]
     grupos_box = grupo_tipo.groupby("threads")["task-clock (s)"]
     data_box   = [g.values for _, g in grupos_box]
