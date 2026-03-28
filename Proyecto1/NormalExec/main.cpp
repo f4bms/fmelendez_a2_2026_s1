@@ -75,8 +75,8 @@ int main(int argc, char* argv[]) {
 
     nn.train(X_train, Y_train, EPOCHS, LEARNING_RATE);
 
-    // (silencioso) evaluamos para mantener el mismo flujo
-    (void)nn.evaluate(X_test, Y_test);
+    double mse = nn.evaluate(X_test, Y_test);
+    cout << mse << endl;
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
